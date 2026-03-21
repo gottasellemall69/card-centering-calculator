@@ -1,0 +1,30 @@
+{
+  "name": "card-front-grader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "^4.9.0-1",
+    "clsx": "^2.1.1",
+    "next": "^16.1.6",
+    "papaparse": "^5.4.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.2.66",
+    "@types/react-dom": "^18.2.22",
+    "@types/uuid": "^9.0.8",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "^16.1.6",
+    "typescript": "^5.4.5"
+  }
+}
