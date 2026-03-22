@@ -43,14 +43,20 @@ input[type="file"]{color:var(--muted)}
 
 .overlayViewer{display:grid;gap:12px}
 .overlayViewerToolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.overlayViewerToolbarActions{display:flex;gap:8px;flex-wrap:wrap}
 .overlayViewerLayout{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
 .overlayViewerPanel{
-  width:180px;
-  min-width:180px;
+  width:240px;
+  min-width:240px;
   padding:14px;
   border:1px solid var(--border);
   border-radius:12px;
   background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
+}
+.overlayViewerPanelSection + .overlayViewerPanelSection{
+  margin-top:18px;
+  padding-top:18px;
+  border-top:1px solid rgba(255,255,255,.08);
 }
 .overlayViewerPanelLabel{
   color:#f472b6;
@@ -64,6 +70,46 @@ input[type="file"]{color:var(--muted)}
 .overlayViewerMetricTitle:first-of-type{margin-top:0}
 .overlayViewerMetricMm{font-size:13px;color:var(--text);margin-top:4px}
 .overlayViewerMetricPct{font-size:22px;font-weight:700;color:#38bdf8;margin-top:4px}
+.overlayViewerNormalizePanel{
+  display:grid;
+  gap:10px;
+  margin-bottom:16px;
+  padding:14px;
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;
+  background:rgba(255,255,255,.03);
+}
+.overlayViewerControlRow{
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+  align-items:flex-start;
+}
+.overlayViewerControl{
+  display:grid;
+  gap:8px;
+  flex:1 1 180px;
+  min-width:160px;
+}
+.overlayViewerControlLabel{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  font-size:12px;
+  color:var(--text);
+}
+.overlayViewerRange{
+  width:100%;
+}
+.overlayViewerNumber{
+  width:100%;
+  background:rgba(255,255,255,.03);
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:8px 10px;
+  border-radius:10px;
+}
 .overlayViewerStage{
   flex:1 1 420px;
   min-width:280px;
@@ -81,6 +127,7 @@ input[type="file"]{color:var(--muted)}
   margin:0 auto;
   line-height:0;
   box-shadow:0 10px 40px rgba(0,0,0,.25);
+  overflow:visible;
 }
 .overlayViewerBase{
   display:block;
@@ -94,6 +141,30 @@ input[type="file"]{color:var(--muted)}
   inset:0;
   overflow:hidden;
   border-radius:8px;
+}
+.overlayViewerCardBackdrop{
+  position:absolute;
+  border-radius:2px;
+  background:var(--panel);
+  box-shadow:0 0 0 1px var(--panel);
+  pointer-events:none;
+}
+.overlayViewerCardShell{
+  position:absolute;
+  overflow:hidden;
+  border-radius:2px;
+  background:var(--panel);
+  box-shadow:0 0 0 1px var(--panel);
+  pointer-events:none;
+}
+.overlayViewerCardLayer{
+  position:absolute;
+  inset:0;
+}
+.overlayViewerCardImage{
+  position:absolute;
+  max-width:none;
+  pointer-events:none;
 }
 .overlayMask{
   position:absolute;

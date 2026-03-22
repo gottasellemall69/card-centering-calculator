@@ -4,12 +4,15 @@
 */
 
 import {
+  assessConditionFromFlaws,
   centeringCapFromWorstSidePct,
   finalGradeFromCaps,
   pointsToCondition,
   severityToPoints,
+  type FlawCategory,
   type GradeCap,
-  type Severity
+  type Severity,
+  type TcgCondition
 } from './rubric';
 
 export type UnscorableReason = {
@@ -48,18 +51,7 @@ export type CenteringResult = {
 };
 
 export type FlawItem = {
-  category:
-    | 'Scratch'
-    | 'Scuffing'
-    | 'Edgewear'
-    | 'Indentation'
-    | 'Grime'
-    | 'Bend'
-    | 'Surface Wear'
-    | 'Fault'
-    | 'Defect'
-    | 'Damage'
-    | 'Corner Rounding';
+  category: FlawCategory;
   severity: Exclude<Severity, 'NONE'>;
   points: number;
   metric: string;
@@ -68,7 +60,16 @@ export type FlawItem = {
 
 export type FlawResult = {
   totalPoints: number;
+  effectivePoints?: number;
   condition: string;
+  pointCondition?: TcgCondition;
+  matrixCondition?: TcgCondition;
+  psaProfile?: string;
+  limitingFlaws?: Array<{
+    category: FlawCategory;
+    severity: Exclude<Severity, 'NONE'>;
+    condition: TcgCondition;
+  }>;
   gradeCap: GradeCap;
   items: FlawItem[];
 };
@@ -165,6 +166,40 @@ export const TUNING = {
   cornerRadiusModeratePx: 18,
   cornerRadiusMajorPx: 28
 };
+
+type VintageReferenceFeatureVector = {
+  grade: number;
+  innerMeanLuma: number;
+  innerStdLuma: number;
+  borderToneSpread: number;
+  interiorStrongPerK: number;
+  interiorLinearPerK: number;
+  borderStdLuma: number;
+};
+
+const VINTAGE_REFERENCE_FALLBACK_VECTORS: readonly VintageReferenceFeatureVector[] = [
+  { grade: 1, innerMeanLuma: 127.9, innerStdLuma: 57.5, borderToneSpread: 46.81, interiorStrongPerK: 180.03, interiorLinearPerK: 176.16, borderStdLuma: 73.7 },
+  { grade: 2, innerMeanLuma: 140.2, innerStdLuma: 55.3, borderToneSpread: 64.54, interiorStrongPerK: 172.06, interiorLinearPerK: 166.43, borderStdLuma: 72.8 },
+  { grade: 3, innerMeanLuma: 129.5, innerStdLuma: 56.2, borderToneSpread: 68.44, interiorStrongPerK: 177.73, interiorLinearPerK: 172.56, borderStdLuma: 74.4 },
+  { grade: 4, innerMeanLuma: 146.0, innerStdLuma: 56.3, borderToneSpread: 9.99, interiorStrongPerK: 178.77, interiorLinearPerK: 177.59, borderStdLuma: 78.8 },
+  { grade: 5, innerMeanLuma: 141.5, innerStdLuma: 56.7, borderToneSpread: 32.91, interiorStrongPerK: 175.57, interiorLinearPerK: 165.72, borderStdLuma: 76.7 },
+  { grade: 6, innerMeanLuma: 139.6, innerStdLuma: 54.9, borderToneSpread: 33.54, interiorStrongPerK: 177.97, interiorLinearPerK: 174.24, borderStdLuma: 78.7 },
+  { grade: 7, innerMeanLuma: 139.5, innerStdLuma: 55.6, borderToneSpread: 31.53, interiorStrongPerK: 181.34, interiorLinearPerK: 170.39, borderStdLuma: 79.6 },
+  { grade: 8, innerMeanLuma: 160.9, innerStdLuma: 50.0, borderToneSpread: 28.58, interiorStrongPerK: 162.77, interiorLinearPerK: 157.65, borderStdLuma: 65.7 },
+  { grade: 9, innerMeanLuma: 157.0, innerStdLuma: 54.3, borderToneSpread: 13.46, interiorStrongPerK: 162.28, interiorLinearPerK: 158.7, borderStdLuma: 66.0 },
+  { grade: 10, innerMeanLuma: 155.5, innerStdLuma: 53.9, borderToneSpread: 21.57, interiorStrongPerK: 161.76, interiorLinearPerK: 153.31, borderStdLuma: 69.2 }
+] as const;
+
+const VINTAGE_REFERENCE_FEATURE_WEIGHTS = {
+  innerMeanLuma: 1.0,
+  innerStdLuma: 0.65,
+  borderToneSpread: 0.7,
+  interiorStrongPerK: 0.75,
+  interiorLinearPerK: 0.9,
+  borderStdLuma: 0.45
+} as const;
+
+let vintageReferenceVectorsPromise: Promise<readonly VintageReferenceFeatureVector[]> | null = null;
 
 let cvPromise: Promise<any> | null = null;
 async function getCV(): Promise<any> {
@@ -429,7 +464,15 @@ async function analyzeCardFrontCanvasFallback(
     return { result };
   }
 
-  const flaws = detectCanvasPsaStyleFlaws(normalizedPx, normalizedWidth, normalizedHeight, normalizedCardBounds);
+  const referenceVectors = await getVintageReferenceVectors();
+  const flaws = detectCanvasPsaStyleFlaws(
+    normalizedPx,
+    normalizedWidth,
+    normalizedHeight,
+    normalizedCardBounds,
+    innerBounds,
+    referenceVectors
+  );
   const finalCap = finalGradeFromCaps(centering.gradeCap, flaws.gradeCap);
   const confidence = computeCanvasConfidence(
     flaws.debug.blurVariance,
@@ -442,7 +485,12 @@ async function analyzeCardFrontCanvasFallback(
     centering,
     flaws: {
       totalPoints: flaws.totalPoints,
+      effectivePoints: flaws.effectivePoints,
       condition: flaws.condition,
+      pointCondition: flaws.pointCondition,
+      matrixCondition: flaws.matrixCondition,
+      psaProfile: flaws.psaProfile,
+      limitingFlaws: flaws.limitingFlaws,
       gradeCap: flaws.gradeCap,
       items: flaws.items
     },
@@ -479,7 +527,7 @@ async function analyzeCardFrontCanvasFallback(
     innerBounds,
     centering,
     result.final.gradeLabel,
-    flaws.totalPoints,
+    flaws.effectivePoints ?? flaws.totalPoints,
     normalizationMethod
   );
 
@@ -527,6 +575,129 @@ async function tryPerspectiveNormalizeWithOpenCV(
     }
   } catch {
     return null;
+  }
+}
+
+async function getVintageReferenceVectors(): Promise<readonly VintageReferenceFeatureVector[]> {
+  if (!vintageReferenceVectorsPromise) {
+    vintageReferenceVectorsPromise = loadVintageReferenceVectors().catch(() => VINTAGE_REFERENCE_FALLBACK_VECTORS);
+  }
+  return vintageReferenceVectorsPromise;
+}
+
+async function loadVintageReferenceVectors(): Promise<readonly VintageReferenceFeatureVector[]> {
+  if (typeof fetch !== 'function' || typeof createImageBitmap !== 'function' || typeof File === 'undefined') {
+    return VINTAGE_REFERENCE_FALLBACK_VECTORS;
+  }
+
+  const grades = VINTAGE_REFERENCE_FALLBACK_VECTORS.map((entry) => entry.grade);
+  const settled = await Promise.allSettled(
+    grades.map(async (grade) => {
+      const response = await fetch(resolvePublicAssetUrl(`/images/Grades/${grade}.jpg`), { cache: 'force-cache' });
+      if (!response.ok) {
+        throw new Error(`Failed to load reference grade ${grade}.`);
+      }
+
+      const blob = await response.blob();
+      const sample = await extractVintageReferenceSampleFromFile(
+        new File([blob], `${grade}.jpg`, { type: blob.type || 'image/png' })
+      );
+      if (!sample) {
+        throw new Error(`Could not extract features for reference grade ${grade}.`);
+      }
+
+      return { grade, ...sample };
+    })
+  );
+
+  const loaded = settled
+    .filter((result): result is PromiseFulfilledResult<VintageReferenceFeatureVector> => result.status === 'fulfilled')
+    .map((result) => result.value)
+    .sort((a, b) => a.grade - b.grade);
+
+  return loaded.length >= Math.max(5, Math.ceil(grades.length * 0.6))
+    ? loaded
+    : VINTAGE_REFERENCE_FALLBACK_VECTORS;
+}
+
+function resolvePublicAssetUrl(path: string): string {
+  if (typeof location !== 'undefined' && location.origin && location.origin !== 'null') {
+    return new URL(path, location.origin).toString();
+  }
+  return path;
+}
+
+async function extractVintageReferenceSampleFromFile(
+  file: File
+): Promise<Omit<VintageReferenceFeatureVector, 'grade'> | null> {
+  const bmp = await createImageBitmap(file);
+  try {
+    const longEdge = Math.max(bmp.width, bmp.height);
+    const scale = longEdge > TUNING.maxInputLongEdgePx ? TUNING.maxInputLongEdgePx / longEdge : 1;
+    const width = Math.max(1, Math.round(bmp.width * scale));
+    const height = Math.max(1, Math.round(bmp.height * scale));
+
+    const baseCanvas = createProcessingCanvas(width, height);
+    const baseCtx = baseCanvas.getContext('2d');
+    if (!baseCtx) return null;
+
+    baseCtx.drawImage(bmp, 0, 0, width, height);
+    const sourceImageData = baseCtx.getImageData(0, 0, width, height);
+    const sourcePx = sourceImageData.data;
+
+    const borderColor = estimateBorderColor(sourcePx, width, height);
+    const colorBounds = estimateContentBounds(sourcePx, width, height, borderColor);
+    const profileBounds = detectOuterCardBounds(sourcePx, width, height);
+    const sourceCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height)
+      ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
+    const paddedSourceCardBounds = expandBounds(sourceCardBounds, width, height, CROPSCALE_PADDING_FRAC);
+    const aspectAlignedSourceCardBounds = fitBoundsToAspect(
+      paddedSourceCardBounds,
+      width,
+      height,
+      TUNING.cardWidthCm / TUNING.cardHeightCm
+    );
+
+    const normalizedCanvas = createProcessingCanvas(TUNING.rectifiedWidthPx, TUNING.rectifiedHeightPx);
+    const normalizedCtx = normalizedCanvas.getContext('2d');
+    if (!normalizedCtx) return null;
+
+    normalizedCtx.drawImage(
+      baseCanvas as CanvasImageSource,
+      aspectAlignedSourceCardBounds.minX,
+      aspectAlignedSourceCardBounds.minY,
+      Math.max(1, aspectAlignedSourceCardBounds.maxX - aspectAlignedSourceCardBounds.minX + 1),
+      Math.max(1, aspectAlignedSourceCardBounds.maxY - aspectAlignedSourceCardBounds.minY + 1),
+      0,
+      0,
+      TUNING.rectifiedWidthPx,
+      TUNING.rectifiedHeightPx
+    );
+
+    const normalizedImageData = normalizedCtx.getImageData(0, 0, TUNING.rectifiedWidthPx, TUNING.rectifiedHeightPx);
+    const normalizedPx = normalizedImageData.data;
+    const normalizedCardBounds = mapBoundsToNormalizedSpace(
+      sourceCardBounds,
+      aspectAlignedSourceCardBounds,
+      TUNING.rectifiedWidthPx,
+      TUNING.rectifiedHeightPx
+    );
+    const innerBounds = detectInnerContentBounds(
+      normalizedPx,
+      TUNING.rectifiedWidthPx,
+      TUNING.rectifiedHeightPx,
+      normalizedCardBounds
+    );
+
+    return extractVintageReferenceSample(
+      normalizedPx,
+      TUNING.rectifiedWidthPx,
+      TUNING.rectifiedHeightPx,
+      normalizedCardBounds,
+      innerBounds
+    );
+  } finally {
+    if ('close' in bmp) bmp.close();
   }
 }
 
@@ -1580,77 +1751,909 @@ function detectCanvasPsaStyleFlaws(
   px: Uint8ClampedArray,
   width: number,
   height: number,
-  bounds: ContentBounds | null
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null,
+  referenceVectors: readonly VintageReferenceFeatureVector[] = VINTAGE_REFERENCE_FALLBACK_VECTORS
 ): {
   totalPoints: number;
+  effectivePoints: number;
   condition: string;
+  pointCondition: TcgCondition;
+  matrixCondition: TcgCondition;
+  psaProfile: string;
+  limitingFlaws: Array<{
+    category: FlawCategory;
+    severity: Exclude<Severity, 'NONE'>;
+    condition: TcgCondition;
+  }>;
   gradeCap: GradeCap;
   items: FlawItem[];
-  debug: { blurVariance: number; meanLuma: number; stdLuma: number; borderRoughness: number; exposureOffset: number; };
+  debug: {
+    blurVariance: number;
+    meanLuma: number;
+    stdLuma: number;
+    shadowClipFrac: number;
+    highlightClipFrac: number;
+    borderRoughness: number;
+    borderCleanlinessScore: number;
+    borderOutlierPct: number;
+    borderToneSpread: number;
+    edgeWearScore: number;
+    edgeWearOutlierPct: number;
+    cornerWearScore: number;
+    cornerWearOutlierPct: number;
+    interiorAnomalyPerK: number;
+    interiorStrongPerK: number;
+    interiorLinearPerK: number;
+    innerMeanLuma: number;
+    innerStdLuma: number;
+    borderMeanLuma: number;
+    borderStdLuma: number;
+    agingPenalty: number;
+    cleanSceneBonus: number;
+    referenceEstimate: number;
+    referenceNearestGrade: number;
+    referenceConfidence: number;
+    referenceDistance: number;
+    scuffScore: number;
+    scratchScore: number;
+    toneClippingPct: number;
+  };
 } {
   const stats = computeLumaStats(px, width, height);
   const items: FlawItem[] = [];
   const borderRoughness = estimateBorderRoughness(px, width, height, bounds);
+  const borderStats = analyzeCanvasBorderCleanliness(px, width, height, bounds, innerBounds);
+  const wearStats = analyzeCanvasWear(px, width, height, bounds, innerBounds);
+  const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, innerBounds ?? bounds);
+  const toneBands = analyzeCanvasToneBands(px, width, height, bounds, innerBounds);
+  const agingPenalty =
+    Math.max(0, 152 - toneBands.innerMeanLuma) * 0.26
+    + Math.max(0, toneBands.innerStdLuma - 54) * 0.22
+    + Math.max(0, toneBands.borderStdLuma - 70) * 0.14
+    + Math.max(0, borderStats.toneSpread - 26) * 0.18;
+  const cleanSceneBonus =
+    Math.max(0, toneBands.innerMeanLuma - 150) * 0.45
+    + Math.max(0, 54 - toneBands.innerStdLuma) * 0.35
+    + Math.max(0, 70 - toneBands.borderStdLuma) * 0.18;
+  const borderCleanlinessScore = Math.max(
+    0,
+    Math.max(0, borderStats.meanDelta - 11) * 0.75
+      + borderStats.outlierPct * 0.95
+      + Math.max(0, borderStats.toneSpread - 14) * 0.32
+      + agingPenalty * 1.15
+      - cleanSceneBonus * 1.35
+  );
+  const edgeWearScore = Math.max(
+    0,
+    Math.max(0, wearStats.edgeMeanDelta - 15) * 0.9
+      + wearStats.edgeOutlierPct * 0.6
+      + Math.max(0, borderRoughness - 34) * 0.18
+      + agingPenalty * 0.55
+      - cleanSceneBonus * 0.8
+  );
+  const cornerWearScore =
+    Math.max(0, wearStats.cornerMeanDelta - wearStats.edgeBaseline - 3) * 1.55
+    + wearStats.cornerOutlierPct * 0.82
+    + agingPenalty * 0.25;
+  const scuffScore = Math.max(
+    0,
+    Math.max(0, interiorStats.anomalyPerK - 240) * 0.22
+      + Math.max(0, interiorStats.strongPerK - 164) * 0.42
+      + agingPenalty * 0.7
+      - cleanSceneBonus
+  );
+  const scratchScore = Math.max(
+    0,
+    Math.max(0, interiorStats.linearPerK - 156) * 0.55
+      + Math.max(0, interiorStats.strongPerK - 168) * 0.18
+      + agingPenalty * 0.3
+      - cleanSceneBonus * 0.72
+  );
 
-  // Surface wear: calibrated for front-photo grading where slight softness/noise is common.
+  const scratchSeverity: Severity =
+    scratchScore > 9 ? 'Moderate'
+      : scratchScore > 4.5 ? 'Minor'
+        : scratchScore > 1.8 ? 'Slight'
+          : 'NONE';
+  if (scratchSeverity !== 'NONE') {
+    items.push({
+      category: 'Scratch',
+      severity: scratchSeverity,
+      points: severityToPoints(scratchSeverity),
+      metric: `Interior scratch index ${scratchScore.toFixed(1)} (${interiorStats.linearPerK.toFixed(2)} line hits/k)`
+    });
+  }
+
+  const scuffSeverity: Severity =
+    scuffScore > 11 ? 'Moderate'
+      : scuffScore > 5.5 ? 'Minor'
+        : scuffScore > 2.2 ? 'Slight'
+          : 'NONE';
+  if (scuffSeverity !== 'NONE') {
+    items.push({
+      category: 'Scuffing',
+      severity: scuffSeverity,
+      points: severityToPoints(scuffSeverity),
+      metric: `Interior surface index ${scuffScore.toFixed(1)} (${interiorStats.anomalyPerK.toFixed(2)} anomalies/k)`
+    });
+  }
+
+  // Vintage example calibration: card grade separation is driven more by border dirt,
+  // stains, and uneven wear than by absolute scan warmth.
   const surfaceWearSeverity: Severity =
-    stats.blurVariance < 35 ? 'Moderate'
-      : stats.blurVariance < 60 ? 'Minor'
-        : stats.blurVariance < 95 ? 'Slight'
+    borderCleanlinessScore > 42 ? 'Moderate'
+      : borderCleanlinessScore > 28 ? 'Minor'
+        : borderCleanlinessScore > 14 ? 'Slight'
           : 'NONE';
   if (surfaceWearSeverity !== 'NONE') {
     items.push({
       category: 'Surface Wear',
       severity: surfaceWearSeverity,
       points: severityToPoints(surfaceWearSeverity),
-      metric: `Blur variance ${stats.blurVariance.toFixed(1)}`
+      metric: `Border wear index ${borderCleanlinessScore.toFixed(1)} (${borderStats.outlierPct.toFixed(1)}% blemish, spread ${borderStats.toneSpread.toFixed(1)})`
     });
   }
 
   // Edgewear: perimeter roughness around the detected outer-card boundary.
   const edgewearSeverity: Severity =
-    borderRoughness > 52 ? 'Minor'
-      : borderRoughness > 30 ? 'Slight'
-        : 'NONE';
+    edgeWearScore > 36 ? 'Moderate'
+      : edgeWearScore > 24 ? 'Minor'
+        : edgeWearScore > 12 ? 'Slight'
+          : 'NONE';
   if (edgewearSeverity !== 'NONE') {
     items.push({
       category: 'Edgewear',
       severity: edgewearSeverity,
       points: severityToPoints(edgewearSeverity),
-      metric: `Perimeter roughness ${borderRoughness.toFixed(1)}`
+      metric: `Wear index ${edgeWearScore.toFixed(1)} (roughness ${borderRoughness.toFixed(1)}, outliers ${wearStats.edgeOutlierPct.toFixed(1)}%)`
     });
   }
 
-  const exposureOffset = Math.abs(stats.meanLuma - 128);
-  const exposureSeverity: Severity =
-    exposureOffset > 70 ? 'Moderate'
-      : exposureOffset > 52 ? 'Minor'
-        : exposureOffset > 38 ? 'Slight'
+  const cornerWearSeverity: Severity =
+    cornerWearScore > 32 ? 'Moderate'
+      : cornerWearScore > 22 ? 'Minor'
+        : cornerWearScore > 12 ? 'Slight'
+        : 'NONE';
+  if (cornerWearSeverity !== 'NONE') {
+    items.push({
+      category: 'Corner Rounding',
+      severity: cornerWearSeverity,
+      points: severityToPoints(cornerWearSeverity),
+      metric: `Corner wear index ${cornerWearScore.toFixed(1)} (${wearStats.cornerOutlierPct.toFixed(1)}% corner outliers)`
+    });
+  }
+
+  const toneClippingPct = (stats.shadowClipFrac + stats.highlightClipFrac) * 100;
+  const toneSeverity: Severity =
+    toneClippingPct > 18 ? 'Moderate'
+      : toneClippingPct > 10 ? 'Minor'
+        : toneClippingPct > 5 ? 'Slight'
           : 'NONE';
-  if (exposureSeverity !== 'NONE') {
+  if (toneSeverity !== 'NONE') {
     items.push({
       category: 'Defect',
-      severity: exposureSeverity,
-      points: severityToPoints(exposureSeverity),
-      metric: `Exposure offset ${exposureOffset.toFixed(1)}`
+      severity: toneSeverity,
+      points: severityToPoints(toneSeverity),
+      metric: `Tone clipping ${toneClippingPct.toFixed(1)}%`
     });
   }
 
-  const totalPoints = items.reduce((sum, item) => sum + item.points, 0);
-  const mapped = pointsToCondition(totalPoints);
+  const mapped = assessConditionFromFlaws(items);
+  const referenceCalibration = estimateVintageReferenceCalibration(
+    extractVintageReferenceSample(px, width, height, bounds, innerBounds),
+    referenceVectors
+  );
+  const shouldApplyReferenceCalibration = referenceCalibration.confidence >= 0.35;
+  const calibratedAssessment = shouldApplyReferenceCalibration
+    ? pointsToCondition(pointFloorFromReferenceGrade(referenceCalibration.estimatedGrade))
+    : mapped;
+
   return {
-    totalPoints,
-    condition: mapped.condition,
-    gradeCap: mapped.gradeCap,
+    totalPoints: mapped.totalPoints,
+    effectivePoints: calibratedAssessment.effectivePoints,
+    condition: calibratedAssessment.condition,
+    pointCondition: calibratedAssessment.pointCondition,
+    matrixCondition: shouldApplyReferenceCalibration ? calibratedAssessment.matrixCondition : mapped.matrixCondition,
+    psaProfile: calibratedAssessment.psaProfile,
+    limitingFlaws: shouldApplyReferenceCalibration ? [] : mapped.limitingFlaws,
+    gradeCap: calibratedAssessment.gradeCap,
     items,
     debug: {
       blurVariance: stats.blurVariance,
       meanLuma: stats.meanLuma,
       stdLuma: stats.stdLuma,
+      shadowClipFrac: stats.shadowClipFrac,
+      highlightClipFrac: stats.highlightClipFrac,
       borderRoughness,
-      exposureOffset
+      borderCleanlinessScore,
+      borderOutlierPct: borderStats.outlierPct,
+      borderToneSpread: borderStats.toneSpread,
+      edgeWearScore,
+      edgeWearOutlierPct: wearStats.edgeOutlierPct,
+      cornerWearScore,
+      cornerWearOutlierPct: wearStats.cornerOutlierPct,
+      interiorAnomalyPerK: interiorStats.anomalyPerK,
+      interiorStrongPerK: interiorStats.strongPerK,
+      interiorLinearPerK: interiorStats.linearPerK,
+      innerMeanLuma: toneBands.innerMeanLuma,
+      innerStdLuma: toneBands.innerStdLuma,
+      borderMeanLuma: toneBands.borderMeanLuma,
+      borderStdLuma: toneBands.borderStdLuma,
+      agingPenalty,
+      cleanSceneBonus,
+      referenceEstimate: referenceCalibration.estimatedGrade,
+      referenceNearestGrade: referenceCalibration.nearestGrade,
+      referenceConfidence: referenceCalibration.confidence,
+      referenceDistance: referenceCalibration.nearestDistance,
+      scuffScore,
+      scratchScore,
+      toneClippingPct
     }
   };
+}
+
+function analyzeCanvasBorderCleanliness(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): { meanDelta: number; outlierPct: number; toneSpread: number } {
+  if (!bounds || !innerBounds) {
+    return { meanDelta: 0, outlierPct: 0, toneSpread: 0 };
+  }
+
+  const card = {
+    minX: clampInt(bounds.minX, 0, width - 1),
+    minY: clampInt(bounds.minY, 0, height - 1),
+    maxX: clampInt(bounds.maxX, 0, width - 1),
+    maxY: clampInt(bounds.maxY, 0, height - 1)
+  };
+  const inner = {
+    minX: clampInt(innerBounds.minX, card.minX, card.maxX),
+    minY: clampInt(innerBounds.minY, card.minY, card.maxY),
+    maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
+    maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
+  };
+
+  const sampleStep = Math.max(1, Math.floor(Math.min(width, height) / 760));
+  const strips = [
+    sampleBorderStripStats(px, width, card.minX, card.minY, card.maxX, inner.minY - 1, sampleStep),
+    sampleBorderStripStats(px, width, card.minX, inner.maxY + 1, card.maxX, card.maxY, sampleStep),
+    sampleBorderStripStats(px, width, card.minX, inner.minY, inner.minX - 1, inner.maxY, sampleStep),
+    sampleBorderStripStats(px, width, inner.maxX + 1, inner.minY, card.maxX, inner.maxY, sampleStep)
+  ].filter((value): value is { meanDelta: number; outlierPct: number; toneSpread: number } => !!value);
+
+  if (strips.length === 0) {
+    return { meanDelta: 0, outlierPct: 0, toneSpread: 0 };
+  }
+
+  return {
+    meanDelta: strips.reduce((sum, strip) => sum + strip.meanDelta, 0) / strips.length,
+    outlierPct: strips.reduce((sum, strip) => sum + strip.outlierPct, 0) / strips.length,
+    toneSpread: strips.reduce((sum, strip) => sum + strip.toneSpread, 0) / strips.length
+  };
+}
+
+function sampleBorderStripStats(
+  px: Uint8ClampedArray,
+  width: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  step: number
+): { meanDelta: number; outlierPct: number; toneSpread: number } | null {
+  if (minX > maxX || minY > maxY) return null;
+
+  const rValues: number[] = [];
+  const gValues: number[] = [];
+  const bValues: number[] = [];
+  const lumaValues: number[] = [];
+
+  for (let y = minY; y <= maxY; y += step) {
+    for (let x = minX; x <= maxX; x += step) {
+      const idx = (y * width + x) * 4;
+      const r = px[idx];
+      const g = px[idx + 1];
+      const b = px[idx + 2];
+      rValues.push(r);
+      gValues.push(g);
+      bValues.push(b);
+      lumaValues.push(r * 0.299 + g * 0.587 + b * 0.114);
+    }
+  }
+
+  if (lumaValues.length === 0) return null;
+
+  const sortedR = [...rValues].sort((a, b) => a - b);
+  const sortedG = [...gValues].sort((a, b) => a - b);
+  const sortedB = [...bValues].sort((a, b) => a - b);
+  const sortedLuma = [...lumaValues].sort((a, b) => a - b);
+  const refR = percentile(sortedR, 0.5);
+  const refG = percentile(sortedG, 0.5);
+  const refB = percentile(sortedB, 0.5);
+  const refLuma = percentile(sortedLuma, 0.5);
+  const toneSpread = percentile(sortedLuma, 0.75) - percentile(sortedLuma, 0.25);
+  const blemishThreshold = Math.max(20, toneSpread * 1.8);
+
+  let deltaSum = 0;
+  let outlierCount = 0;
+  for (let index = 0; index < lumaValues.length; index++) {
+    const colorDelta = (
+      Math.abs(rValues[index] - refR)
+      + Math.abs(gValues[index] - refG)
+      + Math.abs(bValues[index] - refB)
+    ) / 3;
+    const lumaDelta = Math.abs(lumaValues[index] - refLuma);
+    const combinedDelta = colorDelta * 0.55 + lumaDelta * 0.45;
+    deltaSum += combinedDelta;
+    if (combinedDelta >= blemishThreshold || lumaValues[index] <= refLuma - 24) {
+      outlierCount++;
+    }
+  }
+
+  return {
+    meanDelta: deltaSum / lumaValues.length,
+    outlierPct: (outlierCount / lumaValues.length) * 100,
+    toneSpread
+  };
+}
+
+function analyzeCanvasInteriorDisturbance(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null
+): {
+  anomalyPerK: number;
+  strongPerK: number;
+  linearPerK: number;
+} {
+  if (!bounds) {
+    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0 };
+  }
+
+  const region = insetBoundsByFrac(bounds, width, height, 0.05);
+  const regionWidth = Math.max(1, region.maxX - region.minX + 1);
+  const regionHeight = Math.max(1, region.maxY - region.minY + 1);
+  if (regionWidth < 12 || regionHeight < 12) {
+    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0 };
+  }
+
+  const stride = width + 1;
+  const integral = buildLumaIntegral(px, width, height, stride);
+  const step = clampInt(Math.round(Math.min(regionWidth, regionHeight) / 240), 1, 4);
+  const cols = Math.floor((regionWidth - 1) / step) + 1;
+  const rows = Math.floor((regionHeight - 1) / step) + 1;
+  const anomalyMarks = new Uint8Array(cols * rows);
+  const signals = new Float32Array(cols * rows);
+  const smallRadius = Math.max(1, step);
+  const largeRadius = clampInt(Math.round(Math.min(regionWidth, regionHeight) * 0.012), smallRadius + 2, 12);
+  const anomalyThreshold = 8.5;
+  const strongThreshold = 14.5;
+
+  let sampleCount = 0;
+  let anomalyCount = 0;
+  let strongCount = 0;
+  for (let row = 0; row < rows; row++) {
+    const y = Math.min(region.maxY, region.minY + row * step);
+    for (let col = 0; col < cols; col++) {
+      const x = Math.min(region.maxX, region.minX + col * step);
+      const index = row * cols + col;
+      const smallMean = meanRectFromIntegral(integral, stride, width, height, x - smallRadius, y - smallRadius, x + smallRadius, y + smallRadius);
+      const largeMean = meanRectFromIntegral(integral, stride, width, height, x - largeRadius, y - largeRadius, x + largeRadius, y + largeRadius);
+      const leftMean = meanRectFromIntegral(integral, stride, width, height, x - (largeRadius * 2), y - smallRadius, x - largeRadius, y + smallRadius);
+      const rightMean = meanRectFromIntegral(integral, stride, width, height, x + largeRadius, y - smallRadius, x + (largeRadius * 2), y + smallRadius);
+      const upMean = meanRectFromIntegral(integral, stride, width, height, x - smallRadius, y - (largeRadius * 2), x + smallRadius, y - largeRadius);
+      const downMean = meanRectFromIntegral(integral, stride, width, height, x - smallRadius, y + largeRadius, x + smallRadius, y + (largeRadius * 2));
+      const localGrad = (Math.abs(rightMean - leftMean) + Math.abs(downMean - upMean)) * 0.5;
+      const signal = Math.max(0, Math.abs(smallMean - largeMean) - localGrad * 0.32);
+
+      signals[index] = signal;
+      sampleCount++;
+      if (signal >= anomalyThreshold) {
+        anomalyMarks[index] = 1;
+        anomalyCount++;
+      }
+      if (signal >= strongThreshold) {
+        strongCount++;
+      }
+    }
+  }
+
+  let linearCount = 0;
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const index = row * cols + col;
+      if (!anomalyMarks[index] || signals[index] < anomalyThreshold + 1) continue;
+
+      let bestRun = 1;
+      for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]] as const) {
+        const run = 1
+          + countMarkedRun(anomalyMarks, signals, cols, rows, col, row, dx, dy, anomalyThreshold, 3)
+          + countMarkedRun(anomalyMarks, signals, cols, rows, col, row, -dx, -dy, anomalyThreshold, 3);
+        if (run > bestRun) bestRun = run;
+      }
+
+      if (bestRun >= 4 && signals[index] >= anomalyThreshold + 1.5) {
+        linearCount++;
+      }
+    }
+  }
+
+  return {
+    anomalyPerK: (anomalyCount / Math.max(1, sampleCount)) * 1000,
+    strongPerK: (strongCount / Math.max(1, sampleCount)) * 1000,
+    linearPerK: (linearCount / Math.max(1, sampleCount)) * 1000
+  };
+}
+
+function analyzeCanvasToneBands(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): {
+  innerMeanLuma: number;
+  innerStdLuma: number;
+  borderMeanLuma: number;
+  borderStdLuma: number;
+} {
+  if (!bounds) {
+    return {
+      innerMeanLuma: 0,
+      innerStdLuma: 0,
+      borderMeanLuma: 0,
+      borderStdLuma: 0
+    };
+  }
+
+  const card = {
+    minX: clampInt(bounds.minX, 0, width - 1),
+    minY: clampInt(bounds.minY, 0, height - 1),
+    maxX: clampInt(bounds.maxX, 0, width - 1),
+    maxY: clampInt(bounds.maxY, 0, height - 1)
+  };
+  const fallbackInner = insetBoundsByFrac(card, width, height, 0.08);
+  const innerBase = innerBounds ?? fallbackInner;
+  const inner = {
+    minX: clampInt(innerBase.minX, card.minX, card.maxX),
+    minY: clampInt(innerBase.minY, card.minY, card.maxY),
+    maxX: clampInt(innerBase.maxX, card.minX, card.maxX),
+    maxY: clampInt(innerBase.maxY, card.minY, card.maxY)
+  };
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 760));
+
+  const innerStats = sampleLumaRectStats(px, width, inner.minX, inner.minY, inner.maxX, inner.maxY, step);
+  const borderStats = mergeLumaStats([
+    sampleLumaRectStats(px, width, card.minX, card.minY, card.maxX, inner.minY - 1, step),
+    sampleLumaRectStats(px, width, card.minX, inner.maxY + 1, card.maxX, card.maxY, step),
+    sampleLumaRectStats(px, width, card.minX, inner.minY, inner.minX - 1, inner.maxY, step),
+    sampleLumaRectStats(px, width, inner.maxX + 1, inner.minY, card.maxX, inner.maxY, step)
+  ]);
+
+  return {
+    innerMeanLuma: innerStats.mean,
+    innerStdLuma: innerStats.std,
+    borderMeanLuma: borderStats.mean,
+    borderStdLuma: borderStats.std
+  };
+}
+
+function sampleLumaRectStats(
+  px: Uint8ClampedArray,
+  width: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  step: number
+): { count: number; mean: number; std: number } {
+  if (minX > maxX || minY > maxY) {
+    return { count: 0, mean: 0, std: 0 };
+  }
+
+  let count = 0;
+  let sum = 0;
+  let sumSq = 0;
+  for (let y = minY; y <= maxY; y += step) {
+    for (let x = minX; x <= maxX; x += step) {
+      const idx = (y * width + x) * 4;
+      const luma = px[idx] * 0.299 + px[idx + 1] * 0.587 + px[idx + 2] * 0.114;
+      count++;
+      sum += luma;
+      sumSq += luma * luma;
+    }
+  }
+
+  if (!count) {
+    return { count: 0, mean: 0, std: 0 };
+  }
+
+  const mean = sum / count;
+  const variance = Math.max(0, (sumSq / count) - (mean * mean));
+  return {
+    count,
+    mean,
+    std: Math.sqrt(variance)
+  };
+}
+
+function mergeLumaStats(
+  stats: Array<{ count: number; mean: number; std: number }>
+): { mean: number; std: number } {
+  const valid = stats.filter((entry) => entry.count > 0);
+  if (!valid.length) {
+    return { mean: 0, std: 0 };
+  }
+
+  const totalCount = valid.reduce((sum, entry) => sum + entry.count, 0);
+  const mean = valid.reduce((sum, entry) => sum + (entry.mean * entry.count), 0) / totalCount;
+  const variance = valid.reduce((sum, entry) => {
+    const entryVariance = entry.std * entry.std;
+    const meanDelta = entry.mean - mean;
+    return sum + entry.count * (entryVariance + meanDelta * meanDelta);
+  }, 0) / totalCount;
+
+  return {
+    mean,
+    std: Math.sqrt(Math.max(0, variance))
+  };
+}
+
+function extractVintageReferenceSample(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): Omit<VintageReferenceFeatureVector, 'grade'> {
+  const borderStats = analyzeCanvasBorderCleanliness(px, width, height, bounds, innerBounds);
+  const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, innerBounds ?? bounds);
+  const toneBands = analyzeCanvasToneBands(px, width, height, bounds, innerBounds);
+
+  return {
+    innerMeanLuma: toneBands.innerMeanLuma,
+    innerStdLuma: toneBands.innerStdLuma,
+    borderToneSpread: borderStats.toneSpread,
+    interiorStrongPerK: interiorStats.strongPerK,
+    interiorLinearPerK: interiorStats.linearPerK,
+    borderStdLuma: toneBands.borderStdLuma
+  };
+}
+
+function estimateVintageReferenceCalibration(sample: {
+  innerMeanLuma: number;
+  innerStdLuma: number;
+  borderToneSpread: number;
+  interiorStrongPerK: number;
+  interiorLinearPerK: number;
+  borderStdLuma: number;
+}, referenceVectors: readonly VintageReferenceFeatureVector[] = VINTAGE_REFERENCE_FALLBACK_VECTORS): {
+  estimatedGrade: number;
+  nearestGrade: number;
+  confidence: number;
+  nearestDistance: number;
+} {
+  const featureKeys = Object.keys(VINTAGE_REFERENCE_FEATURE_WEIGHTS) as Array<keyof typeof VINTAGE_REFERENCE_FEATURE_WEIGHTS>;
+  const featureStats = featureKeys.map((key) => {
+    const values = referenceVectors.map((entry) => entry[key]);
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const variance = values.reduce((sum, value) => sum + ((value - mean) * (value - mean)), 0) / values.length;
+    return { key, std: Math.max(1e-6, Math.sqrt(variance)) };
+  });
+
+  const distances = referenceVectors.map((entry) => {
+    const distanceSq = featureStats.reduce((sum, feature) => {
+      const sampleValue = sample[feature.key];
+      const refValue = entry[feature.key];
+      const normalizedDelta = (sampleValue - refValue) / feature.std;
+      return sum + (VINTAGE_REFERENCE_FEATURE_WEIGHTS[feature.key] * normalizedDelta * normalizedDelta);
+    }, 0);
+    return {
+      distance: Math.sqrt(distanceSq),
+      grade: entry.grade
+    };
+  }).sort((a, b) => a.distance - b.distance);
+
+  const nearest = distances[0];
+  const runnerUp = distances[1];
+  const weightedNeighbors = distances.slice(0, 4);
+  const weightedGrade = weightedNeighbors.reduce((sum, neighbor) => {
+    const weight = 1 / ((neighbor.distance * neighbor.distance) + 0.05);
+    return sum + (weight * neighbor.grade);
+  }, 0) / weightedNeighbors.reduce((sum, neighbor) => {
+    const weight = 1 / ((neighbor.distance * neighbor.distance) + 0.05);
+    return sum + weight;
+  }, 0);
+  const nearestDistance = nearest?.distance ?? Number.POSITIVE_INFINITY;
+  const separation = runnerUp ? runnerUp.distance - nearestDistance : nearestDistance;
+  const separationConfidence = clamp01(separation / 0.9);
+  const nearestGrade = nearest?.grade ?? 1;
+  const estimatedGrade = nearestDistance <= 0.24
+    ? nearestGrade
+    : clampNumber((weightedGrade * (1 - separationConfidence * 0.35)) + (nearestGrade * separationConfidence * 0.35), 1, 10);
+
+  return {
+    estimatedGrade,
+    nearestGrade,
+    confidence: clamp01((1 - (nearestDistance / 3)) * 0.8 + separationConfidence * 0.2),
+    nearestDistance
+  };
+}
+
+function pointFloorFromReferenceGrade(estimate: number): number {
+  const roundedGrade = clampInt(Math.round(estimate), 1, 10);
+  switch (roundedGrade) {
+    case 10:
+      return 0;
+    case 9:
+      return 1;
+    case 8:
+      return 2;
+    case 7:
+      return 3;
+    case 6:
+      return 5;
+    case 5:
+      return 7;
+    case 4:
+      return 10;
+    case 3:
+      return 14;
+    case 2:
+      return 19;
+    default:
+      return 28;
+  }
+}
+
+function insetBoundsByFrac(bounds: ContentBounds, width: number, height: number, frac: number): ContentBounds {
+  if (frac <= 0) return bounds;
+  const padX = Math.max(1, Math.round((bounds.maxX - bounds.minX + 1) * frac));
+  const padY = Math.max(1, Math.round((bounds.maxY - bounds.minY + 1) * frac));
+  const minX = clampInt(bounds.minX + padX, 0, width - 2);
+  const minY = clampInt(bounds.minY + padY, 0, height - 2);
+  const maxX = clampInt(bounds.maxX - padX, minX + 1, width - 1);
+  const maxY = clampInt(bounds.maxY - padY, minY + 1, height - 1);
+  return { minX, minY, maxX, maxY };
+}
+
+function buildLumaIntegral(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  stride: number
+): Float32Array {
+  const integral = new Float32Array(stride * (height + 1));
+  for (let y = 1; y <= height; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= width; x++) {
+      const idx = ((y - 1) * width + (x - 1)) * 4;
+      const luma = px[idx] * 0.299 + px[idx + 1] * 0.587 + px[idx + 2] * 0.114;
+      rowSum += luma;
+      integral[y * stride + x] = integral[(y - 1) * stride + x] + rowSum;
+    }
+  }
+  return integral;
+}
+
+function meanRectFromIntegral(
+  integral: Float32Array,
+  stride: number,
+  width: number,
+  height: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number
+): number {
+  const x0 = clampInt(minX, 0, width - 1);
+  const y0 = clampInt(minY, 0, height - 1);
+  const x1 = clampInt(maxX, x0, width - 1);
+  const y1 = clampInt(maxY, y0, height - 1);
+  const area = Math.max(1, (x1 - x0 + 1) * (y1 - y0 + 1));
+  const total =
+    integral[(y1 + 1) * stride + (x1 + 1)]
+    - integral[y0 * stride + (x1 + 1)]
+    - integral[(y1 + 1) * stride + x0]
+    + integral[y0 * stride + x0];
+  return total / area;
+}
+
+function countMarkedRun(
+  marks: Uint8Array,
+  signals: Float32Array,
+  cols: number,
+  rows: number,
+  startCol: number,
+  startRow: number,
+  dx: number,
+  dy: number,
+  threshold: number,
+  maxSteps: number
+): number {
+  let count = 0;
+  for (let step = 1; step <= maxSteps; step++) {
+    const col = startCol + dx * step;
+    const row = startRow + dy * step;
+    if (col < 0 || col >= cols || row < 0 || row >= rows) break;
+    const index = row * cols + col;
+    if (!marks[index] || signals[index] < threshold) break;
+    count++;
+  }
+  return count;
+}
+
+function analyzeCanvasWear(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): {
+  edgeBaseline: number;
+  edgeMeanDelta: number;
+  edgeOutlierPct: number;
+  cornerMeanDelta: number;
+  cornerOutlierPct: number;
+} {
+  if (!bounds || !innerBounds) {
+    return {
+      edgeBaseline: 0,
+      edgeMeanDelta: 0,
+      edgeOutlierPct: 0,
+      cornerMeanDelta: 0,
+      cornerOutlierPct: 0
+    };
+  }
+
+  const card = {
+    minX: clampInt(bounds.minX, 0, width - 1),
+    minY: clampInt(bounds.minY, 0, height - 1),
+    maxX: clampInt(bounds.maxX, 0, width - 1),
+    maxY: clampInt(bounds.maxY, 0, height - 1)
+  };
+  const inner = {
+    minX: clampInt(innerBounds.minX, card.minX, card.maxX),
+    minY: clampInt(innerBounds.minY, card.minY, card.maxY),
+    maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
+    maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
+  };
+
+  const edgeDeltas: number[] = [];
+  const cornerDeltas: number[] = [];
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 420));
+  const sides: Array<'left' | 'right' | 'top' | 'bottom'> = ['left', 'right', 'top', 'bottom'];
+
+  for (const side of sides) {
+    const borderThickness = side === 'left'
+      ? inner.minX - card.minX
+      : side === 'right'
+        ? card.maxX - inner.maxX
+        : side === 'top'
+          ? inner.minY - card.minY
+          : card.maxY - inner.maxY;
+    if (borderThickness < 4) continue;
+
+    const alongMin = side === 'left' || side === 'right' ? card.minY : card.minX;
+    const alongMax = side === 'left' || side === 'right' ? card.maxY : card.maxX;
+    const alongSpan = alongMax - alongMin + 1;
+    const edgeDepth = clampInt(Math.round(borderThickness * 0.34), 1, Math.max(1, borderThickness - 1));
+    const referenceOffset = clampInt(Math.round(borderThickness * 0.42), 2, Math.max(2, borderThickness - 1));
+    const cornerZone = clampInt(Math.round(alongSpan * 0.12), 6, Math.max(6, Math.round(alongSpan * 0.18)));
+
+    for (let along = alongMin; along <= alongMax; along += step) {
+      const inCornerZone = along - alongMin <= cornerZone || alongMax - along <= cornerZone;
+      for (let depth = 0; depth < edgeDepth; depth++) {
+        const refDepth = Math.min(borderThickness - 1, depth + referenceOffset);
+        if (refDepth <= depth) continue;
+
+        const outer = borderWearPoint(card, side, along, depth);
+        const reference = borderWearPoint(card, side, along, refDepth);
+        const delta = wearDeltaBetweenPixels(px, width, outer.x, outer.y, reference.x, reference.y);
+        edgeDeltas.push(delta);
+        if (inCornerZone) cornerDeltas.push(delta);
+      }
+    }
+  }
+
+  const edgeStats = summarizeWearDeltas(edgeDeltas);
+  const cornerStats = summarizeWearDeltas(cornerDeltas, edgeStats.baseline, edgeStats.threshold);
+  return {
+    edgeBaseline: edgeStats.baseline,
+    edgeMeanDelta: edgeStats.mean,
+    edgeOutlierPct: edgeStats.outlierPct,
+    cornerMeanDelta: cornerStats.mean,
+    cornerOutlierPct: cornerStats.outlierPct
+  };
+}
+
+function borderWearPoint(
+  card: ContentBounds,
+  side: 'left' | 'right' | 'top' | 'bottom',
+  along: number,
+  depth: number
+): { x: number; y: number } {
+  switch (side) {
+    case 'left':
+      return { x: card.minX + depth, y: along };
+    case 'right':
+      return { x: card.maxX - depth, y: along };
+    case 'top':
+      return { x: along, y: card.minY + depth };
+    case 'bottom':
+      return { x: along, y: card.maxY - depth };
+  }
+}
+
+function wearDeltaBetweenPixels(
+  px: Uint8ClampedArray,
+  width: number,
+  xA: number,
+  yA: number,
+  xB: number,
+  yB: number
+): number {
+  const indexA = (yA * width + xA) * 4;
+  const indexB = (yB * width + xB) * 4;
+
+  const rA = px[indexA];
+  const gA = px[indexA + 1];
+  const bA = px[indexA + 2];
+  const rB = px[indexB];
+  const gB = px[indexB + 1];
+  const bB = px[indexB + 2];
+
+  const colorDelta = (Math.abs(rA - rB) + Math.abs(gA - gB) + Math.abs(bA - bB)) / 3;
+  const lumaDelta = Math.abs(
+    (rA * 0.299 + gA * 0.587 + bA * 0.114)
+    - (rB * 0.299 + gB * 0.587 + bB * 0.114)
+  );
+  return colorDelta * 0.7 + lumaDelta * 0.45;
+}
+
+function summarizeWearDeltas(
+  deltas: number[],
+  baselineOverride?: number,
+  thresholdOverride?: number
+): { mean: number; baseline: number; threshold: number; outlierPct: number } {
+  if (deltas.length === 0) {
+    return {
+      mean: 0,
+      baseline: baselineOverride ?? 0,
+      threshold: thresholdOverride ?? 0,
+      outlierPct: 0
+    };
+  }
+
+  const sorted = [ ...deltas ].sort((a, b) => a - b);
+  const mean = deltas.reduce((sum, value) => sum + value, 0) / deltas.length;
+  const baseline = baselineOverride ?? percentile(sorted, 0.5);
+  const spread = percentile(sorted, 0.75) - percentile(sorted, 0.25);
+  const threshold = thresholdOverride ?? Math.max(14, baseline + Math.max(4, spread * 1.8));
+  const outlierCount = deltas.reduce((sum, value) => sum + (value >= threshold ? 1 : 0), 0);
+  return {
+    mean,
+    baseline,
+    threshold,
+    outlierPct: (outlierCount / deltas.length) * 100
+  };
+}
+
+function percentile(sortedValues: number[], fraction: number): number {
+  if (sortedValues.length === 0) return 0;
+  if (sortedValues.length === 1) return sortedValues[0];
+  const clampedFraction = Math.max(0, Math.min(1, fraction));
+  const position = clampedFraction * (sortedValues.length - 1);
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  if (lowerIndex === upperIndex) return sortedValues[lowerIndex];
+  const weight = position - lowerIndex;
+  return sortedValues[lowerIndex] + (sortedValues[upperIndex] - sortedValues[lowerIndex]) * weight;
 }
 
 function estimateBorderRoughness(
@@ -1699,7 +2702,17 @@ function estimateBorderRoughness(
   return sum / count;
 }
 
-function computeLumaStats(px: Uint8ClampedArray, width: number, height: number): { meanLuma: number; stdLuma: number; blurVariance: number } {
+function computeLumaStats(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number
+): {
+  meanLuma: number;
+  stdLuma: number;
+  blurVariance: number;
+  shadowClipFrac: number;
+  highlightClipFrac: number;
+} {
   const step = Math.max(1, Math.floor(Math.min(width, height) / 320));
   let count = 0;
   let sum = 0;
@@ -1707,6 +2720,8 @@ function computeLumaStats(px: Uint8ClampedArray, width: number, height: number):
   let lapCount = 0;
   let lapSum = 0;
   let lapSumSq = 0;
+  let shadowClipCount = 0;
+  let highlightClipCount = 0;
 
   const lumaAt = (x: number, y: number) => {
     const i = (y * width + x) * 4;
@@ -1719,6 +2734,8 @@ function computeLumaStats(px: Uint8ClampedArray, width: number, height: number):
       sum += c;
       sumSq += c * c;
       count++;
+      if (c <= 18) shadowClipCount++;
+      if (c >= 238) highlightClipCount++;
 
       const lap = (4 * c) - lumaAt(x - 1, y) - lumaAt(x + 1, y) - lumaAt(x, y - 1) - lumaAt(x, y + 1);
       lapSum += lap;
@@ -1732,7 +2749,13 @@ function computeLumaStats(px: Uint8ClampedArray, width: number, height: number):
   const stdLuma = Math.sqrt(varLuma);
   const meanLap = lapCount ? lapSum / lapCount : 0;
   const blurVariance = lapCount ? Math.max(0, (lapSumSq / lapCount) - (meanLap * meanLap)) : 0;
-  return { meanLuma, stdLuma, blurVariance };
+  return {
+    meanLuma,
+    stdLuma,
+    blurVariance,
+    shadowClipFrac: count ? shadowClipCount / count : 0,
+    highlightClipFrac: count ? highlightClipCount / count : 0
+  };
 }
 
 function computeCanvasConfidence(blurVariance: number, meanLuma: number, stdLuma: number, hasBounds: boolean): number {
@@ -2131,11 +3154,19 @@ function detectFlaws(cv: any, rectifiedRGBA: any): FlawResult {
   const corner = detectCornerRounding(cv, rectifiedRGBA);
   if (corner) items.push(corner);
 
-  // Aggregate points
-  const totalPoints = items.reduce((s, it) => s + it.points, 0);
-  const { condition, gradeCap } = pointsToCondition(totalPoints);
+  const assessed = assessConditionFromFlaws(items);
 
-  return { totalPoints, condition, gradeCap, items };
+  return {
+    totalPoints: assessed.totalPoints,
+    effectivePoints: assessed.effectivePoints,
+    condition: assessed.condition,
+    pointCondition: assessed.pointCondition,
+    matrixCondition: assessed.matrixCondition,
+    psaProfile: assessed.psaProfile,
+    limitingFlaws: assessed.limitingFlaws,
+    gradeCap: assessed.gradeCap,
+    items
+  };
 }
 
 function detectScratches(cv: any, rgba: any, pxPerCm: number): FlawItem | null {
@@ -2525,9 +3556,13 @@ function drawOverlay(cv: any, rectifiedRGBA: any, centering: CenteringResult | n
   }
 
   // Flaw summary text
+  const flawPointsLabel =
+    flaws.effectivePoints && flaws.effectivePoints !== flaws.totalPoints
+      ? `${flaws.totalPoints}->${flaws.effectivePoints}`
+      : `${flaws.totalPoints}`;
   cv.putText(
     overlay,
-    `Flaw points: ${flaws.totalPoints} (${flaws.condition}) cap ${flaws.gradeCap.gradeLabel}`,
+    `Flaw points: ${flawPointsLabel} (${flaws.condition}) cap ${flaws.gradeCap.gradeLabel}`,
     new cv.Point(12, 48),
     cv.FONT_HERSHEY_SIMPLEX,
     0.55,

@@ -730,6 +730,7 @@ export default function Page() {
                 <th>Engine</th>
                 <th>Elapsed</th>
                 <th>Grade</th>
+                <th>Est. #</th>
                 <th>Center</th>
                 <th>Flaw pts</th>
                 <th>Conf.</th>
@@ -738,11 +739,13 @@ export default function Page() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="small">No files yet.</td>
+                  <td colSpan={9} className="small">No files yet.</td>
                 </tr>
               ) : (
                 rows.map((row) => {
                   const displayRowResult = row.result ? applyManualCenteringOverride(row.result, row.manualCentering ?? null) : null;
+                  const previewNumeric = row.preview?.final?.psaNumeric;
+                  const estimatedNumeric = displayRowResult?.final?.psaNumeric ?? null;
                   return (
                     <tr
                       key={row.id}
@@ -770,8 +773,17 @@ export default function Page() {
                           '-'
                         )}
                       </td>
+                      <td>
+                        {estimatedNumeric != null ? (
+                          estimatedNumeric
+                        ) : previewNumeric != null ? (
+                          <span style={{ color: 'var(--muted)' }}>~{previewNumeric}</span>
+                        ) : (
+                          '-'
+                        )}
+                      </td>
                       <td>{displayRowResult?.centering?.worst?.ratio ?? row.manualCentering?.worst?.ratio ?? row.preview?.centering?.worst?.ratio ?? '-'}</td>
-                      <td>{displayRowResult?.flaws?.totalPoints ?? '-'}</td>
+                      <td>{displayRowResult?.flaws?.effectivePoints ?? displayRowResult?.flaws?.totalPoints ?? '-'}</td>
                       <td>{displayRowResult ? displayRowResult.final.confidence.toFixed(2) : '-'}</td>
                     </tr>
                   );
@@ -877,8 +889,19 @@ export default function Page() {
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Estimate</h3>
                 <div className="kv"><div className="small">Grade</div><div>{displayedResult.final.gradeLabel} (PSA {displayedResult.final.psaNumeric})</div></div>
                 <div className="kv"><div className="small">Confidence</div><div>{displayedResult.final.confidence.toFixed(2)}</div></div>
+                <div className="kv"><div className="small">Condition</div><div>{displayedResult.flaws?.condition ?? '-'}</div></div>
                 <div className="kv"><div className="small">Flaw cap</div><div>{displayedResult.flaws?.gradeCap?.gradeLabel ?? '-'}</div></div>
-                <div className="kv"><div className="small">Total flaw points</div><div>{displayedResult.flaws?.totalPoints ?? '-'}</div></div>
+                <div className="kv"><div className="small">Flaw profile</div><div>{displayedResult.flaws?.psaProfile ?? '-'}</div></div>
+                <div className="kv">
+                  <div className="small">Total flaw points</div>
+                  <div>
+                    {!displayedResult.flaws
+                      ? '-'
+                      : displayedResult.flaws.effectivePoints && displayedResult.flaws.effectivePoints !== displayedResult.flaws.totalPoints
+                        ? `${displayedResult.flaws.totalPoints} raw / ${displayedResult.flaws.effectivePoints} rubric`
+                        : displayedResult.flaws.totalPoints}
+                  </div>
+                </div>
 
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Flaws</h3>
                 <div className="small" style={{ marginTop: 8 }}>
@@ -894,6 +917,11 @@ export default function Page() {
                     'No flaws detected above thresholds.'
                   )}
                 </div>
+                {displayedResult.flaws?.limitingFlaws?.length ? (
+                  <div className="notice" style={{ marginTop: 10 }}>
+                    Matrix floor applied from {displayedResult.flaws.limitingFlaws.map((item) => `${item.category} ${item.severity}`).join(', ')}.
+                  </div>
+                ) : null}
               </>
             ) : (
               <>

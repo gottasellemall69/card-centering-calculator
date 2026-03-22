@@ -1,8 +1,8 @@
 import type { FlawItem, GradeResult } from './grader';
 import {
+  assessConditionFromFlaws,
   centeringCapFromWorstSidePct,
   finalGradeFromCaps,
-  pointsToCondition,
   severityToPoints
 } from './rubric';
 
@@ -49,8 +49,7 @@ export function buildManualPsaEstimate(input: ManualPsaObservation): GradeResult
     points: severityToPoints(flaw.severity),
     metric: flaw.metric
   }));
-  const totalPoints = flawItems.reduce((sum, flaw) => sum + flaw.points, 0);
-  const flawCondition = pointsToCondition(totalPoints);
+  const flawCondition = assessConditionFromFlaws(flawItems);
   const finalCap = finalGradeFromCaps(centeringCap, flawCondition.gradeCap);
 
   return {
@@ -76,8 +75,13 @@ export function buildManualPsaEstimate(input: ManualPsaObservation): GradeResult
       }
     },
     flaws: {
-      totalPoints,
+      totalPoints: flawCondition.totalPoints,
+      effectivePoints: flawCondition.effectivePoints,
       condition: flawCondition.condition,
+      pointCondition: flawCondition.pointCondition,
+      matrixCondition: flawCondition.matrixCondition,
+      psaProfile: flawCondition.psaProfile,
+      limitingFlaws: flawCondition.limitingFlaws,
       gradeCap: flawCondition.gradeCap,
       items: flawItems
     },
