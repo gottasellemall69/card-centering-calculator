@@ -555,7 +555,7 @@ export default function Page() {
 
   const downloadJSON = () => {
     const payload = rows
-      .filter((row) => row.result)
+      .filter(hasSavedResult)
       .map((row) => ({ id: row.id, filename: row.filename, ...row.result }));
     const blob = new Blob([JSON.stringify({ generatedAt: new Date().toISOString(), results: payload }, null, 2)], {
       type: 'application/json'
@@ -570,9 +570,9 @@ export default function Page() {
 
   const downloadCSV = () => {
     const data = rows
-      .filter((row) => row.result)
+      .filter(hasSavedResult)
       .map((row) => {
-        const result = row.result!;
+        const result = row.result;
         return {
           filename: row.filename,
           grade: result.final.gradeLabel,
@@ -959,7 +959,7 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
       psaNumeric: finalCap.psaNumeric
     },
     debug: {
-      ...result.debug,
+      ...(result.debug ?? {}),
       manualCenteringApplied: true,
       manualCentering: {
         lr: manualCentering.lr,
@@ -973,6 +973,10 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
       }
     }
   };
+}
+
+function hasSavedResult(row: Row): row is Row & { result: GradeResult } {
+  return Boolean(row.result);
 }
 
 function sameCentering(

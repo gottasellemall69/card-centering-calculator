@@ -287,7 +287,7 @@ async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; 
   const flawRes = detectFlaws(cv, rectified);
 
   // Combine caps
-  const centeringCap = centering?.gradeCap ?? { gradeLabel: 'PR', psaNumeric: 1 };
+  const centeringCap = centering?.gradeCap ?? { gradeLabel: 'PR 1', psaNumeric: 1 };
   const flawCap = flawRes.gradeCap;
   const finalCap = finalGradeFromCaps(centeringCap, flawCap);
 
@@ -3588,6 +3588,10 @@ function computeConfidence(args: { blurVar: number; glareFrac: number; skewAngle
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function clampInt(value: number, min: number, max: number): number {
