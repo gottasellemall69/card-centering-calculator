@@ -161,6 +161,9 @@ export const TUNING = {
   defectModerateCm2: 1,
 
   // Corner rounding heuristic thresholds (radius in px on rectified image)
+  // Modern cards, especially Yu-Gi-Oh, often have visibly rounded factory corners.
+  // Treat a baseline radius as normal before escalating to a flaw.
+  cornerNaturalRadiusAllowancePx: 8,
   cornerRadiusSlightPx: 5,
   cornerRadiusMinorPx: 10,
   cornerRadiusModeratePx: 18,
@@ -1816,25 +1819,33 @@ function detectCanvasPsaStyleFlaws(
     Math.max(0, toneBands.innerMeanLuma - 150) * 0.45
     + Math.max(0, 54 - toneBands.innerStdLuma) * 0.35
     + Math.max(0, 70 - toneBands.borderStdLuma) * 0.18;
+  const borderVariationAllowance = 10 + borderStats.toneSpread * 0.22;
+  const borderOutlierAllowance = Math.max(2.5, borderStats.toneSpread * 0.22);
+  const normalizedBorderMeanDelta = Math.max(0, borderStats.meanDelta - borderVariationAllowance);
+  const normalizedBorderOutlierPct = Math.max(0, borderStats.outlierPct - borderOutlierAllowance);
+  const normalizedEdgeMeanDelta = Math.max(0, wearStats.edgeMeanDelta - wearStats.edgeBaseline - 5);
+  const normalizedEdgeOutlierPct = Math.max(0, wearStats.edgeOutlierPct - 2);
   const borderCleanlinessScore = Math.max(
     0,
-    Math.max(0, borderStats.meanDelta - 11) * 0.75
-      + borderStats.outlierPct * 0.95
-      + Math.max(0, borderStats.toneSpread - 14) * 0.32
-      + agingPenalty * 1.15
-      - cleanSceneBonus * 1.35
+    normalizedBorderMeanDelta * 0.82
+      + normalizedBorderOutlierPct * 0.72
+      + Math.max(0, borderStats.toneSpread - 26) * 0.14
+      + agingPenalty * 0.45
+      - cleanSceneBonus * 1.25
   );
   const edgeWearScore = Math.max(
     0,
-    Math.max(0, wearStats.edgeMeanDelta - 15) * 0.9
-      + wearStats.edgeOutlierPct * 0.6
-      + Math.max(0, borderRoughness - 34) * 0.18
-      + agingPenalty * 0.55
-      - cleanSceneBonus * 0.8
+    normalizedEdgeMeanDelta * 1.05
+      + normalizedEdgeOutlierPct * 0.55
+      + Math.max(0, borderRoughness - 46) * 0.08
+      + agingPenalty * 0.28
+      - cleanSceneBonus * 0.72
   );
+  const normalizedCornerMeanDelta = Math.max(0, wearStats.cornerMeanDelta - wearStats.edgeBaseline - 7);
+  const normalizedCornerOutlierPct = Math.max(0, wearStats.cornerOutlierPct - 2.5);
   const cornerWearScore =
-    Math.max(0, wearStats.cornerMeanDelta - wearStats.edgeBaseline - 3) * 1.55
-    + wearStats.cornerOutlierPct * 0.82
+    normalizedCornerMeanDelta * 1.35
+    + normalizedCornerOutlierPct * 0.65
     + agingPenalty * 0.25;
   const scuffScore = Math.max(
     0,
@@ -1868,7 +1879,7 @@ function detectCanvasPsaStyleFlaws(
   const scuffSeverity: Severity =
     scuffScore > 11 ? 'Moderate'
       : scuffScore > 5.5 ? 'Minor'
-        : scuffScore > 2.2 ? 'Slight'
+        : scuffScore > 3.4 ? 'Slight'
           : 'NONE';
   if (scuffSeverity !== 'NONE') {
     items.push({
@@ -1882,9 +1893,9 @@ function detectCanvasPsaStyleFlaws(
   // Vintage example calibration: card grade separation is driven more by border dirt,
   // stains, and uneven wear than by absolute scan warmth.
   const surfaceWearSeverity: Severity =
-    borderCleanlinessScore > 42 ? 'Moderate'
-      : borderCleanlinessScore > 28 ? 'Minor'
-        : borderCleanlinessScore > 14 ? 'Slight'
+    borderCleanlinessScore > 54 ? 'Moderate'
+      : borderCleanlinessScore > 36 ? 'Minor'
+        : borderCleanlinessScore > 24 ? 'Slight'
           : 'NONE';
   if (surfaceWearSeverity !== 'NONE') {
     items.push({
@@ -1897,9 +1908,9 @@ function detectCanvasPsaStyleFlaws(
 
   // Edgewear: perimeter roughness around the detected outer-card boundary.
   const edgewearSeverity: Severity =
-    edgeWearScore > 36 ? 'Moderate'
-      : edgeWearScore > 24 ? 'Minor'
-        : edgeWearScore > 12 ? 'Slight'
+    edgeWearScore > 44 ? 'Moderate'
+      : edgeWearScore > 30 ? 'Minor'
+        : edgeWearScore > 20 ? 'Slight'
           : 'NONE';
   if (edgewearSeverity !== 'NONE') {
     items.push({
@@ -1911,9 +1922,9 @@ function detectCanvasPsaStyleFlaws(
   }
 
   const cornerWearSeverity: Severity =
-    cornerWearScore > 32 ? 'Moderate'
-      : cornerWearScore > 22 ? 'Minor'
-        : cornerWearScore > 12 ? 'Slight'
+    cornerWearScore > 38 ? 'Moderate'
+      : cornerWearScore > 26 ? 'Minor'
+        : cornerWearScore > 15 ? 'Slight'
         : 'NONE';
   if (cornerWearSeverity !== 'NONE') {
     items.push({
@@ -3470,12 +3481,13 @@ function detectCornerRounding(cv: any, rgba: any): FlawItem | null {
   }
 
   const radiusPx = radii.reduce((a, b) => a + b, 0) / radii.length;
+  const effectiveRadiusPx = Math.max(0, radiusPx - TUNING.cornerNaturalRadiusAllowancePx);
 
   let sev: Severity = 'NONE';
-  if (radiusPx >= TUNING.cornerRadiusMajorPx) sev = 'Major';
-  else if (radiusPx >= TUNING.cornerRadiusModeratePx) sev = 'Moderate';
-  else if (radiusPx >= TUNING.cornerRadiusMinorPx) sev = 'Minor';
-  else if (radiusPx >= TUNING.cornerRadiusSlightPx) sev = 'Slight';
+  if (effectiveRadiusPx >= TUNING.cornerRadiusMajorPx) sev = 'Major';
+  else if (effectiveRadiusPx >= TUNING.cornerRadiusModeratePx) sev = 'Moderate';
+  else if (effectiveRadiusPx >= TUNING.cornerRadiusMinorPx) sev = 'Minor';
+  else if (effectiveRadiusPx >= TUNING.cornerRadiusSlightPx) sev = 'Slight';
 
   gray.delete();
   edges.delete();
@@ -3485,7 +3497,7 @@ function detectCornerRounding(cv: any, rgba: any): FlawItem | null {
     category: 'Corner Rounding',
     severity: sev,
     points: severityToPoints(sev),
-    metric: `Avg corner radius ≈ ${radiusPx.toFixed(1)} px`
+    metric: `Avg corner radius ≈ ${radiusPx.toFixed(1)} px (${effectiveRadiusPx.toFixed(1)} px over natural allowance)`
   };
 }
 
