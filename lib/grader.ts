@@ -50,11 +50,88 @@ export type CenteringResult = {
   };
 };
 
+export type EvidenceStrength = 'high' | 'medium' | 'low';
+
+export type Observability = 'observed' | 'inferred' | 'assumed' | 'not_observable';
+
+export type FindingSeverity = 'none' | 'slight' | 'minor' | 'moderate' | 'major';
+
+export type FindingCategory = 'corners' | 'edges' | 'surface' | 'shape' | 'quality';
+
+export type FindingMeasurement = {
+  kind: 'length_cm' | 'area_cm2' | 'area_mm2' | 'count' | 'ratio' | 'index' | 'pixels';
+  value: number;
+  display: string;
+  approximate: boolean;
+  normalized?: number;
+};
+
+export type FindingRegion = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  normalized: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
+};
+
+export type DetectedFinding = {
+  id: string;
+  category: FindingCategory;
+  flawType: string;
+  location: string;
+  severity: FindingSeverity;
+  evidenceStrength: EvidenceStrength;
+  observability: Observability;
+  metric: string;
+  notes: string[];
+  measurement?: FindingMeasurement;
+  count?: number;
+  region?: FindingRegion;
+};
+
+export type QualityCheck = {
+  key: 'blur' | 'glare' | 'low_resolution' | 'occlusion' | 'cropping' | 'perspective' | 'full_front_border';
+  label: string;
+  observed: boolean;
+  severity: 'none' | 'low' | 'moderate' | 'high';
+  metric?: string;
+  note: string;
+  impactsObservability: boolean;
+};
+
+export type QualityAssessment = {
+  readable: boolean;
+  imageQualityScore: number; // 0..1
+  blurVariance: number;
+  meanLuma: number;
+  stdLuma: number;
+  resolution: { width: number; height: number; longEdgePx: number };
+  cardDetected: boolean;
+  fullFrontVisible: boolean;
+  checks: QualityCheck[];
+};
+
+export type GradeCeilingAssessment = {
+  source: 'centering' | 'visible_defect' | 'confidence';
+  cap: GradeCap;
+  reason: string;
+};
+
 export type FlawItem = {
   category: FlawCategory;
   severity: Exclude<Severity, 'NONE'>;
   points: number;
   metric: string;
+  location?: string;
+  evidenceStrength?: EvidenceStrength;
+  observability?: Exclude<Observability, 'not_observable'>;
+  measurement?: FindingMeasurement;
+  region?: FindingRegion;
   debug?: Record<string, unknown>;
 };
 
@@ -72,6 +149,39 @@ export type FlawResult = {
   }>;
   gradeCap: GradeCap;
   items: FlawItem[];
+  detectedFindings?: DetectedFinding[];
+  cornerFindings?: DetectedFinding[];
+  edgeFindings?: DetectedFinding[];
+  surfaceFindings?: DetectedFinding[];
+  shapeFindings?: DetectedFinding[];
+  notReliablyObservable?: string[];
+};
+
+export type StructuredGradeReport = {
+  imageName?: string;
+  cardDetected: boolean;
+  fullFrontVisible: boolean;
+  imageQuality: QualityAssessment;
+  frontCenteringLR?: string;
+  frontCenteringTB?: string;
+  effectiveFrontCentering?: string;
+  cornerFindings: DetectedFinding[];
+  edgeFindings: DetectedFinding[];
+  surfaceFindings: DetectedFinding[];
+  shapeFindings: DetectedFinding[];
+  detectedDefects: DetectedFinding[];
+  defectPointsTotal: number;
+  centeringGradeCeiling: GradeCeilingAssessment;
+  visibleDefectGradeCeiling: GradeCeilingAssessment;
+  confidenceGradeCeiling: GradeCeilingAssessment;
+  finalGradeLabel: string;
+  finalGradeNumeric: number;
+  confidenceBand: 'low' | 'medium' | 'high';
+  manualReviewRequired: boolean;
+  assumptions: string[];
+  limitations: string[];
+  topReasons: string[];
+  topChangeDrivers: string[];
 };
 
 export type GradeResult = {
@@ -84,6 +194,7 @@ export type GradeResult = {
     psaNumeric: number;
     confidence: number; // 0..1
   };
+  report?: StructuredGradeReport;
   debug?: Record<string, unknown>;
 };
 
@@ -109,6 +220,8 @@ export const TUNING = {
   blurVarianceThreshold: 90, // Laplacian variance
   glareSaturationThreshold: 245,
   glareMaxFrac: 0.08,
+  lowResolutionLongEdgePx: 900,
+  moderateResolutionLongEdgePx: 1200,
 
   // Border detection (inner content extraction)
   borderSearchInsetFrac: 0.03, // ignore extreme outer pixels during search
@@ -427,6 +540,15 @@ async function analyzeCardFrontCanvasFallback(
     );
   const innerBounds = detectInnerContentBounds(normalizedPx, normalizedWidth, normalizedHeight, normalizedCardBounds);
   const centering = buildCanvasCentering(normalizedCardBounds, innerBounds, normalizedWidth, normalizedHeight);
+  const sourceStats = computeLumaStats(sourcePx, width, height);
+  const qualityAssessment = buildCanvasQualityAssessment({
+    stats: sourceStats,
+    sourceWidth: width,
+    sourceHeight: height,
+    cardBounds,
+    innerBounds
+  });
+  const confidenceCeiling = observabilityCeilingFromQuality(qualityAssessment);
 
   const baseDebug = {
     fallback: true,
@@ -444,6 +566,8 @@ async function analyzeCardFrontCanvasFallback(
     perspectiveQuad,
     normalizedCardBounds,
     innerBounds,
+    qualityAssessment,
+    confidenceCeiling,
     psaStyle: {
       centering: {
         lr: centering.lr.ratio,
@@ -454,14 +578,34 @@ async function analyzeCardFrontCanvasFallback(
   };
 
   if (mode === 'prepare') {
+    const previewCap = finalGradeFromCaps(centering.gradeCap, confidenceCeiling.cap);
     const result: GradeResult = {
       centering,
       final: {
         unscorable: false,
-        gradeLabel: centering.gradeCap.gradeLabel,
-        psaNumeric: centering.gradeCap.psaNumeric,
-        confidence: 0
+        gradeLabel: previewCap.gradeLabel,
+        psaNumeric: previewCap.psaNumeric,
+        confidence: qualityAssessment.imageQualityScore
       },
+      report: buildStructuredGradeReport({
+        imageName: file.name,
+        quality: qualityAssessment,
+        centering,
+        flaws: undefined,
+        confidenceCeiling,
+        finalGradeLabel: previewCap.gradeLabel,
+        finalGradeNumeric: previewCap.psaNumeric,
+        confidence: qualityAssessment.imageQualityScore,
+        assumptions: [
+          'Front image only.',
+          'Standard card size assumed as 6.4cm x 8.9cm when converting normalized pixel distances.',
+          'Preview mode estimates centering and observability only; visible defect scoring is deferred until grading.'
+        ],
+        limitations: [
+          'Back-side defects are intentionally excluded.',
+          'Manual guide adjustment may still be needed before grading.'
+        ]
+      }),
       debug: baseDebug
     };
     return { result };
@@ -476,13 +620,14 @@ async function analyzeCardFrontCanvasFallback(
     innerBounds,
     referenceVectors
   );
-  const finalCap = finalGradeFromCaps(centering.gradeCap, flaws.gradeCap);
-  const confidence = computeCanvasConfidence(
+  const centeringAndFlawCap = finalGradeFromCaps(centering.gradeCap, flaws.gradeCap);
+  const finalCap = finalGradeFromCaps(centeringAndFlawCap, confidenceCeiling.cap);
+  const confidence = clamp01((computeCanvasConfidence(
     flaws.debug.blurVariance,
     flaws.debug.meanLuma,
     flaws.debug.stdLuma,
     !!innerBounds
-  );
+  ) * 0.55) + (qualityAssessment.imageQualityScore * 0.45));
 
   const result: GradeResult = {
     centering,
@@ -495,7 +640,13 @@ async function analyzeCardFrontCanvasFallback(
       psaProfile: flaws.psaProfile,
       limitingFlaws: flaws.limitingFlaws,
       gradeCap: flaws.gradeCap,
-      items: flaws.items
+      items: flaws.items,
+      detectedFindings: flaws.detectedFindings,
+      cornerFindings: flaws.cornerFindings,
+      edgeFindings: flaws.edgeFindings,
+      surfaceFindings: flaws.surfaceFindings,
+      shapeFindings: flaws.shapeFindings,
+      notReliablyObservable: flaws.notReliablyObservable
     },
     final: {
       unscorable: false,
@@ -503,6 +654,41 @@ async function analyzeCardFrontCanvasFallback(
       psaNumeric: finalCap.psaNumeric,
       confidence
     },
+    report: buildStructuredGradeReport({
+      imageName: file.name,
+      quality: qualityAssessment,
+      centering,
+      flaws: {
+        totalPoints: flaws.totalPoints,
+        effectivePoints: flaws.effectivePoints,
+        condition: flaws.condition,
+        pointCondition: flaws.pointCondition,
+        matrixCondition: flaws.matrixCondition,
+        psaProfile: flaws.psaProfile,
+        limitingFlaws: flaws.limitingFlaws,
+        gradeCap: flaws.gradeCap,
+        items: flaws.items,
+        detectedFindings: flaws.detectedFindings,
+        cornerFindings: flaws.cornerFindings,
+        edgeFindings: flaws.edgeFindings,
+        surfaceFindings: flaws.surfaceFindings,
+        shapeFindings: flaws.shapeFindings,
+        notReliablyObservable: flaws.notReliablyObservable
+      },
+      confidenceCeiling,
+      finalGradeLabel: finalCap.gradeLabel,
+      finalGradeNumeric: finalCap.psaNumeric,
+      confidence,
+      assumptions: [
+        'Front image only.',
+        'Standard card size assumed as 6.4cm x 8.9cm for normalized conversions.',
+        'Visible defect thresholds are heuristic proxies derived from the supplied rubric.'
+      ],
+      limitations: [
+        'This is a conservative automated pre-grade, not an official grading outcome.',
+        'Glare, blur, and crop quality can materially change the estimate.'
+      ]
+    }),
     debug: {
       ...baseDebug,
       psaStyle: {
@@ -513,7 +699,13 @@ async function analyzeCardFrontCanvasFallback(
           points: item.points,
           metric: item.metric
         })),
-        flawDebug: flaws.debug
+        flawDebug: flaws.debug,
+        finalCaps: {
+          centering: centering.gradeCap,
+          visibleDefect: flaws.gradeCap,
+          confidence: confidenceCeiling.cap,
+          final: finalCap
+        }
       }
     }
   };
@@ -529,8 +721,7 @@ async function analyzeCardFrontCanvasFallback(
     normalizedCardBounds,
     innerBounds,
     centering,
-    result.final.gradeLabel,
-    flaws.effectivePoints ?? flaws.totalPoints,
+    result,
     normalizationMethod
   );
 
@@ -554,7 +745,7 @@ function ensureCanvasGradeArtifacts(analysis: { result: GradeResult; overlayPNG?
   };
 }
 
-type ContentBounds = { minX: number; minY: number; maxX: number; maxY: number; };
+export type ContentBounds = { minX: number; minY: number; maxX: number; maxY: number; };
 
 async function tryPerspectiveNormalizeWithOpenCV(
   sourceImageData: ImageData
@@ -757,8 +948,7 @@ function renderMeasurementOverlay(
   cardBounds: ContentBounds,
   innerBounds: ContentBounds | null,
   centering: CenteringResult,
-  gradeLabel: string,
-  flawPoints: number,
+  result: GradeResult,
   normalizationMethod: 'opencv_perspective' | 'crop_scale'
 ): void {
   ctx.clearRect(0, 0, width, height);
@@ -806,7 +996,8 @@ function renderMeasurementOverlay(
   });
 
   drawCenterCrosshair(ctx, cardBounds);
-  drawCenteringSummary(ctx, cardBounds, centering, gradeLabel, flawPoints, normalizationMethod);
+  drawFindingHighlights(ctx, result);
+  drawCenteringSummary(ctx, cardBounds, centering, result, normalizationMethod);
 }
 
 function drawOutsideCardShade(ctx: OverlayContext2D, width: number, height: number, cardBounds: ContentBounds): void {
@@ -942,8 +1133,7 @@ function drawCenteringSummary(
   ctx: OverlayContext2D,
   cardBounds: ContentBounds,
   centering: CenteringResult,
-  gradeLabel: string,
-  flawPoints: number,
+  result: GradeResult,
   normalizationMethod: 'opencv_perspective' | 'crop_scale'
 ): void {
   const cardWidthPx = Math.max(1, cardBounds.maxX - cardBounds.minX + 1);
@@ -954,9 +1144,12 @@ function drawCenteringSummary(
   const bottomMm = pxToMillimeters(centering.debug.border.bottomPx, cardHeightPx, TUNING.cardHeightCm * 10);
 
   const boxX = clampInt(cardBounds.minX + 12, 8, Math.max(8, cardBounds.maxX - 280));
-  const boxY = clampInt(cardBounds.minY + 12, 8, Math.max(8, cardBounds.maxY - 82));
+  const boxY = clampInt(cardBounds.minY + 12, 8, Math.max(8, cardBounds.maxY - 128));
   const boxW = Math.min(272, Math.max(180, cardBounds.maxX - cardBounds.minX - 24));
-  const boxH = 76;
+  const boxH = 120;
+  const flawPoints = result.flaws?.effectivePoints ?? result.flaws?.totalPoints ?? 0;
+  const confidence = result.final.confidence;
+  const majorIssues = result.report?.topReasons?.slice(0, 2)?.join(' | ') ?? 'No major issues above threshold.';
 
   ctx.save();
   ctx.fillStyle = 'rgba(17, 24, 39, 0.72)';
@@ -982,15 +1175,82 @@ function drawCenteringSummary(
   );
 
   ctx.fillStyle = 'rgba(212, 212, 216, 0.85)';
-  ctx.fillText(`Grade ${gradeLabel}  |  Flaw pts ${flawPoints}  |  ${normalizationMethod}`, boxX + 10, boxY + 72);
+  ctx.fillText(`Grade ${result.final.gradeLabel}  |  Flaw pts ${flawPoints}  |  ${normalizationMethod}`, boxX + 10, boxY + 74);
+  ctx.fillText(`Confidence ${confidence.toFixed(2)}  |  Review ${result.report?.manualReviewRequired ? 'YES' : 'NO'}`, boxX + 10, boxY + 92);
+  ctx.font = '11px sans-serif';
+  wrapOverlayText(ctx, `Issues: ${majorIssues}`, boxX + 10, boxY + 108, boxW - 18, 12, 2);
   ctx.restore();
+}
+
+function drawFindingHighlights(ctx: OverlayContext2D, result: GradeResult): void {
+  const findings = (result.report?.detectedDefects ?? [])
+    .filter((finding) => finding.observability === 'observed' && finding.region)
+    .sort((a, b) => findingSeverityRank(b.severity) - findingSeverityRank(a.severity))
+    .slice(0, 6);
+
+  findings.forEach((finding) => {
+    if (!finding.region) return;
+    const color = finding.severity === 'major'
+      ? 'rgba(239, 68, 68, 0.95)'
+      : finding.severity === 'moderate'
+        ? 'rgba(249, 115, 22, 0.95)'
+        : finding.severity === 'minor'
+          ? 'rgba(245, 158, 11, 0.95)'
+          : 'rgba(250, 204, 21, 0.95)';
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color.replace('0.95', '0.12');
+    ctx.lineWidth = 2;
+    ctx.fillRect(finding.region.x, finding.region.y, finding.region.w, finding.region.h);
+    ctx.strokeRect(finding.region.x + 0.5, finding.region.y + 0.5, finding.region.w - 1, finding.region.h - 1);
+    ctx.font = '600 11px sans-serif';
+    const label = `${finding.flawType} (${finding.severity})`;
+    const labelWidth = Math.min(Math.max(76, ctx.measureText(label).width + 10), 180);
+    const labelX = clampInt(finding.region.x, 2, Math.max(2, finding.region.x + finding.region.w - labelWidth));
+    const labelY = clampInt(finding.region.y - 16, 2, Math.max(2, finding.region.y));
+    ctx.fillStyle = 'rgba(17, 24, 39, 0.82)';
+    ctx.fillRect(labelX, labelY, labelWidth, 14);
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillText(label, labelX + 5, labelY + 10);
+    ctx.restore();
+  });
+}
+
+function wrapOverlayText(
+  ctx: OverlayContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+  maxLines: number
+): void {
+  const words = text.split(/\s+/);
+  let line = '';
+  let lineIndex = 0;
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth || !line) {
+      line = candidate;
+      continue;
+    }
+
+    ctx.fillText(line, x, y + (lineIndex * lineHeight));
+    line = word;
+    lineIndex++;
+    if (lineIndex >= maxLines) return;
+  }
+
+  if (lineIndex < maxLines && line) {
+    ctx.fillText(line, x, y + (lineIndex * lineHeight));
+  }
 }
 
 function pxToMillimeters(px: number, axisPx: number, physicalMm: number): number {
   return (px / Math.max(1, axisPx)) * physicalMm;
 }
 
-function fitBoundsToAspect(
+export function fitBoundsToAspect(
   bounds: ContentBounds,
   width: number,
   height: number,
@@ -1222,7 +1482,7 @@ function detectOuterCardBounds(
   return { minX: left, minY: top, maxX: right, maxY: bottom };
 }
 
-function chooseBestCardBounds(
+export function chooseBestCardBounds(
   colorBounds: ContentBounds | null,
   profileBounds: ContentBounds | null,
   width: number,
@@ -1691,7 +1951,7 @@ function findProminentProfileEdge(
   return null;
 }
 
-function buildCanvasCentering(
+export function buildCanvasCentering(
   cardBounds: ContentBounds | null,
   innerBounds: ContentBounds | null,
   width: number,
@@ -1750,7 +2010,153 @@ function buildCanvasCentering(
   };
 }
 
-function detectCanvasPsaStyleFlaws(
+function severityToFindingSeverity(severity: Severity | Exclude<Severity, 'NONE'>): FindingSeverity {
+  switch (severity) {
+    case 'Slight':
+      return 'slight';
+    case 'Minor':
+      return 'minor';
+    case 'Moderate':
+      return 'moderate';
+    case 'Major':
+      return 'major';
+    default:
+      return 'none';
+  }
+}
+
+function findingEvidenceFromSeverity(severity: FindingSeverity): EvidenceStrength {
+  switch (severity) {
+    case 'major':
+    case 'moderate':
+      return 'high';
+    case 'minor':
+      return 'medium';
+    case 'slight':
+      return 'low';
+    default:
+      return 'low';
+  }
+}
+
+function pxLengthToCm(pxLength: number, axisPx: number, physicalCm: number): number {
+  return (pxLength / Math.max(1, axisPx)) * physicalCm;
+}
+
+function pxAreaToCm2(pxArea: number, cardWidthPx: number, cardHeightPx: number): number {
+  const cmPerPxX = TUNING.cardWidthCm / Math.max(1, cardWidthPx);
+  const cmPerPxY = TUNING.cardHeightCm / Math.max(1, cardHeightPx);
+  return pxArea * cmPerPxX * cmPerPxY;
+}
+
+function pxAreaToMm2(pxArea: number, cardWidthPx: number, cardHeightPx: number): number {
+  return pxAreaToCm2(pxArea, cardWidthPx, cardHeightPx) * 100;
+}
+
+function toFindingRegion(bounds: ContentBounds, width: number, height: number): FindingRegion {
+  return {
+    x: bounds.minX,
+    y: bounds.minY,
+    w: Math.max(1, bounds.maxX - bounds.minX + 1),
+    h: Math.max(1, bounds.maxY - bounds.minY + 1),
+    normalized: {
+      x: bounds.minX / Math.max(1, width),
+      y: bounds.minY / Math.max(1, height),
+      w: Math.max(1, bounds.maxX - bounds.minX + 1) / Math.max(1, width),
+      h: Math.max(1, bounds.maxY - bounds.minY + 1) / Math.max(1, height)
+    }
+  };
+}
+
+function regionAreaPx(region: FindingRegion): number {
+  return Math.max(1, region.w) * Math.max(1, region.h);
+}
+
+function formatLengthCm(value: number): string {
+  return `${value.toFixed(2)}cm`;
+}
+
+function formatAreaCm2(value: number): string {
+  return `${value.toFixed(2)}cm²`;
+}
+
+function formatAreaMm2(value: number): string {
+  return `${value.toFixed(2)}mm²`;
+}
+
+function confidenceBandFromScore(confidence: number): 'low' | 'medium' | 'high' {
+  if (confidence >= 0.75) return 'high';
+  if (confidence >= 0.45) return 'medium';
+  return 'low';
+}
+
+function gradeCapReason(source: GradeCeilingAssessment['source'], cap: GradeCap, detail: string): GradeCeilingAssessment {
+  return {
+    source,
+    cap,
+    reason: `${cap.gradeLabel}: ${detail}`
+  };
+}
+
+function summarizeFinding(findings: DetectedFinding[]): string[] {
+  return findings
+    .filter((finding) => finding.observability === 'observed')
+    .sort((a, b) => findingSeverityRank(b.severity) - findingSeverityRank(a.severity))
+    .slice(0, 3)
+    .map((finding) => `${finding.flawType} at ${finding.location} (${finding.severity})`);
+}
+
+function findingSeverityRank(severity: FindingSeverity): number {
+  switch (severity) {
+    case 'major':
+      return 4;
+    case 'moderate':
+      return 3;
+    case 'minor':
+      return 2;
+    case 'slight':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function describeBoundsLocation(bounds: ContentBounds, width: number, height: number): string {
+  const centerX = (bounds.minX + bounds.maxX) * 0.5;
+  const centerY = (bounds.minY + bounds.maxY) * 0.5;
+  const horizontal = centerX < width * 0.33 ? 'left' : centerX > width * 0.67 ? 'right' : 'center';
+  const vertical = centerY < height * 0.33 ? 'top' : centerY > height * 0.67 ? 'bottom' : 'center';
+  if (horizontal === 'center' && vertical === 'center') return 'center';
+  if (horizontal === 'center') return vertical;
+  if (vertical === 'center') return horizontal;
+  return `${vertical}-${horizontal}`;
+}
+
+type InteriorHotspot = {
+  bounds: ContentBounds;
+  sampleCount: number;
+  strongCount: number;
+  linearCount: number;
+  maxSignal: number;
+  kind: 'scratch' | 'scuffing';
+};
+
+type BorderHotspot = {
+  bounds: ContentBounds;
+  side: 'left' | 'right' | 'top' | 'bottom';
+  deviation: number;
+  outlierPct: number;
+};
+
+type CornerHotspot = {
+  name: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+  bounds: ContentBounds;
+  meanDelta: number;
+  outlierPct: number;
+  score: number;
+};
+
+export function detectCanvasPsaStyleFlaws(
   px: Uint8ClampedArray,
   width: number,
   height: number,
@@ -1771,6 +2177,12 @@ function detectCanvasPsaStyleFlaws(
   }>;
   gradeCap: GradeCap;
   items: FlawItem[];
+  detectedFindings: DetectedFinding[];
+  cornerFindings: DetectedFinding[];
+  edgeFindings: DetectedFinding[];
+  surfaceFindings: DetectedFinding[];
+  shapeFindings: DetectedFinding[];
+  notReliablyObservable: string[];
   debug: {
     blurVariance: number;
     meanLuma: number;
@@ -1805,11 +2217,68 @@ function detectCanvasPsaStyleFlaws(
 } {
   const stats = computeLumaStats(px, width, height);
   const items: FlawItem[] = [];
+  const detectedFindings: DetectedFinding[] = [];
   const borderRoughness = estimateBorderRoughness(px, width, height, bounds);
   const borderStats = analyzeCanvasBorderCleanliness(px, width, height, bounds, innerBounds);
   const wearStats = analyzeCanvasWear(px, width, height, bounds, innerBounds);
   const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, innerBounds ?? bounds);
   const toneBands = analyzeCanvasToneBands(px, width, height, bounds, innerBounds);
+  const borderHotspots = detectBorderHotspots(px, width, height, bounds, innerBounds);
+  const cornerHotspots = detectCornerHotspots(px, width, height, bounds, innerBounds);
+  const measurementBounds = bounds ?? innerBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
+  const cardWidthPx = Math.max(1, measurementBounds.maxX - measurementBounds.minX + 1);
+  const cardHeightPx = Math.max(1, measurementBounds.maxY - measurementBounds.minY + 1);
+  let findingSequence = 0;
+
+  const createObservedFinding = (args: {
+    category: FindingCategory;
+    flawType: string;
+    severity: FindingSeverity;
+    metric: string;
+    location: string;
+    notes: string[];
+    measurement?: FindingMeasurement;
+    region?: FindingRegion;
+    evidenceStrength?: EvidenceStrength;
+    count?: number;
+  }): DetectedFinding => {
+    const finding: DetectedFinding = {
+      id: `${args.category}-${findingSequence++}`,
+      category: args.category,
+      flawType: args.flawType,
+      location: args.location,
+      severity: args.severity,
+      evidenceStrength: args.evidenceStrength ?? findingEvidenceFromSeverity(args.severity),
+      observability: 'observed',
+      metric: args.metric,
+      notes: args.notes,
+      measurement: args.measurement,
+      count: args.count,
+      region: args.region
+    };
+    detectedFindings.push(finding);
+    return finding;
+  };
+
+  const addFlawItem = (
+    category: FlawCategory,
+    severity: Exclude<Severity, 'NONE'>,
+    metric: string,
+    finding?: DetectedFinding
+  ) => {
+    items.push({
+      category,
+      severity,
+      points: severityToPoints(severity),
+      metric,
+      location: finding?.location,
+      evidenceStrength: finding?.evidenceStrength,
+      observability: finding?.observability === 'observed' ? 'observed' : undefined,
+      measurement: finding?.measurement,
+      region: finding?.region
+    });
+  };
+
   const agingPenalty =
     Math.max(0, 152 - toneBands.innerMeanLuma) * 0.26
     + Math.max(0, toneBands.innerStdLuma - 54) * 0.22
@@ -1868,12 +2337,30 @@ function detectCanvasPsaStyleFlaws(
         : scratchScore > 1.8 ? 'Slight'
           : 'NONE';
   if (scratchSeverity !== 'NONE') {
-    items.push({
-      category: 'Scratch',
-      severity: scratchSeverity,
-      points: severityToPoints(scratchSeverity),
-      metric: `Interior scratch index ${scratchScore.toFixed(1)} (${interiorStats.linearPerK.toFixed(2)} line hits/k)`
+    const hotspot = interiorStats.hotspots.find((candidate) => candidate.kind === 'scratch') ?? interiorStats.hotspots[0];
+    const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
+    const hotspotLengthPx = region ? Math.max(region.w, region.h) : 0;
+    const measurement = region
+      ? {
+        kind: 'length_cm' as const,
+        value: pxLengthToCm(hotspotLengthPx, hotspotLengthPx === region.w ? cardWidthPx : cardHeightPx, hotspotLengthPx === region.w ? TUNING.cardWidthCm : TUNING.cardHeightCm),
+        display: formatLengthCm(pxLengthToCm(hotspotLengthPx, hotspotLengthPx === region.w ? cardWidthPx : cardHeightPx, hotspotLengthPx === region.w ? TUNING.cardWidthCm : TUNING.cardHeightCm)),
+        approximate: true,
+        normalized: hotspotLengthPx / Math.max(1, Math.max(cardWidthPx, cardHeightPx))
+      }
+      : undefined;
+    const finding = createObservedFinding({
+      category: 'surface',
+      flawType: 'scratch',
+      severity: severityToFindingSeverity(scratchSeverity),
+      metric: `Interior scratch index ${scratchScore.toFixed(1)} (${interiorStats.linearPerK.toFixed(2)} line hits/k)`,
+      location: hotspot ? describeBoundsLocation(hotspot.bounds, width, height) : 'interior',
+      notes: ['Detected from line-like anomaly clusters in the rectified front image.', 'Length is approximate and normalized to the assumed standard card size.'],
+      measurement,
+      region,
+      evidenceStrength: hotspot ? 'medium' : 'low'
     });
+    addFlawItem('Scratch', scratchSeverity, finding.metric, finding);
   }
 
   const scuffSeverity: Severity =
@@ -1882,12 +2369,27 @@ function detectCanvasPsaStyleFlaws(
         : scuffScore > 3.4 ? 'Slight'
           : 'NONE';
   if (scuffSeverity !== 'NONE') {
-    items.push({
-      category: 'Scuffing',
-      severity: scuffSeverity,
-      points: severityToPoints(scuffSeverity),
-      metric: `Interior surface index ${scuffScore.toFixed(1)} (${interiorStats.anomalyPerK.toFixed(2)} anomalies/k)`
+    const hotspot = interiorStats.hotspots.find((candidate) => candidate.kind === 'scuffing') ?? interiorStats.hotspots[0];
+    const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
+    const areaCm2 = region ? pxAreaToCm2(regionAreaPx(region), cardWidthPx, cardHeightPx) : 0;
+    const finding = createObservedFinding({
+      category: 'surface',
+      flawType: 'scuffing',
+      severity: severityToFindingSeverity(scuffSeverity),
+      metric: `Interior surface index ${scuffScore.toFixed(1)} (${interiorStats.anomalyPerK.toFixed(2)} anomalies/k)`,
+      location: hotspot ? describeBoundsLocation(hotspot.bounds, width, height) : 'interior',
+      notes: ['Detected from clustered interior texture anomalies in the rectified front image.', 'Area is approximate and should be manually reviewed against glare and scan noise.'],
+      measurement: region ? {
+        kind: 'area_cm2',
+        value: areaCm2,
+        display: formatAreaCm2(areaCm2),
+        approximate: true,
+        normalized: areaCm2 / Math.max(0.001, TUNING.cardWidthCm * TUNING.cardHeightCm)
+      } : undefined,
+      region,
+      evidenceStrength: hotspot && hotspot.sampleCount >= 4 ? 'medium' : 'low'
     });
+    addFlawItem('Scuffing', scuffSeverity, finding.metric, finding);
   }
 
   // Vintage example calibration: card grade separation is driven more by border dirt,
@@ -1898,12 +2400,27 @@ function detectCanvasPsaStyleFlaws(
         : borderCleanlinessScore > 24 ? 'Slight'
           : 'NONE';
   if (surfaceWearSeverity !== 'NONE') {
-    items.push({
-      category: 'Surface Wear',
-      severity: surfaceWearSeverity,
-      points: severityToPoints(surfaceWearSeverity),
-      metric: `Border wear index ${borderCleanlinessScore.toFixed(1)} (${borderStats.outlierPct.toFixed(1)}% blemish, spread ${borderStats.toneSpread.toFixed(1)})`
+    const hotspot = borderHotspots[0];
+    const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
+    const areaCm2 = region ? pxAreaToCm2(regionAreaPx(region), cardWidthPx, cardHeightPx) : 0;
+    const finding = createObservedFinding({
+      category: 'surface',
+      flawType: 'surface wear',
+      severity: severityToFindingSeverity(surfaceWearSeverity),
+      metric: `Border wear index ${borderCleanlinessScore.toFixed(1)} (${borderStats.outlierPct.toFixed(1)}% blemish, spread ${borderStats.toneSpread.toFixed(1)})`,
+      location: hotspot ? describeBoundsLocation(hotspot.bounds, width, height) : 'border region',
+      notes: ['Border cleanliness and tonal spread were used as a proxy for visible front-side wear.', 'This does not directly measure gloss loss or indentation depth.'],
+      measurement: region ? {
+        kind: 'area_cm2',
+        value: areaCm2,
+        display: formatAreaCm2(areaCm2),
+        approximate: true,
+        normalized: areaCm2 / Math.max(0.001, TUNING.cardWidthCm * TUNING.cardHeightCm)
+      } : undefined,
+      region,
+      evidenceStrength: hotspot && hotspot.outlierPct >= 18 ? 'high' : 'medium'
     });
+    addFlawItem('Surface Wear', surfaceWearSeverity, finding.metric, finding);
   }
 
   // Edgewear: perimeter roughness around the detected outer-card boundary.
@@ -1913,12 +2430,36 @@ function detectCanvasPsaStyleFlaws(
         : edgeWearScore > 20 ? 'Slight'
           : 'NONE';
   if (edgewearSeverity !== 'NONE') {
-    items.push({
-      category: 'Edgewear',
-      severity: edgewearSeverity,
-      points: severityToPoints(edgewearSeverity),
-      metric: `Wear index ${edgeWearScore.toFixed(1)} (roughness ${borderRoughness.toFixed(1)}, outliers ${wearStats.edgeOutlierPct.toFixed(1)}%)`
+    const hotspot = borderHotspots.find((candidate) => candidate.side === 'left' || candidate.side === 'right' || candidate.side === 'top' || candidate.side === 'bottom');
+    const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
+    const lengthPx = hotspot
+      ? hotspot.side === 'left' || hotspot.side === 'right'
+        ? hotspot.bounds.maxY - hotspot.bounds.minY + 1
+        : hotspot.bounds.maxX - hotspot.bounds.minX + 1
+      : 0;
+    const lengthCm = hotspot
+      ? hotspot.side === 'left' || hotspot.side === 'right'
+        ? pxLengthToCm(lengthPx, cardHeightPx, TUNING.cardHeightCm)
+        : pxLengthToCm(lengthPx, cardWidthPx, TUNING.cardWidthCm)
+      : 0;
+    const finding = createObservedFinding({
+      category: 'edges',
+      flawType: 'edge wear',
+      severity: severityToFindingSeverity(edgewearSeverity),
+      metric: `Wear index ${edgeWearScore.toFixed(1)} (roughness ${borderRoughness.toFixed(1)}, outliers ${wearStats.edgeOutlierPct.toFixed(1)}%)`,
+      location: hotspot ? hotspot.side : 'perimeter',
+      notes: ['Detected from border roughness and side-strip outliers.', 'Visible whitening, chipping, and notching are proxied rather than physically measured.'],
+      measurement: hotspot ? {
+        kind: 'length_cm',
+        value: lengthCm,
+        display: formatLengthCm(lengthCm),
+        approximate: true,
+        normalized: lengthPx / Math.max(1, hotspot.side === 'left' || hotspot.side === 'right' ? cardHeightPx : cardWidthPx)
+      } : undefined,
+      region,
+      evidenceStrength: hotspot && hotspot.outlierPct >= 16 ? 'high' : 'medium'
     });
+    addFlawItem('Edgewear', edgewearSeverity, finding.metric, finding);
   }
 
   const cornerWearSeverity: Severity =
@@ -1927,12 +2468,25 @@ function detectCanvasPsaStyleFlaws(
         : cornerWearScore > 15 ? 'Slight'
         : 'NONE';
   if (cornerWearSeverity !== 'NONE') {
-    items.push({
-      category: 'Corner Rounding',
-      severity: cornerWearSeverity,
-      points: severityToPoints(cornerWearSeverity),
-      metric: `Corner wear index ${cornerWearScore.toFixed(1)} (${wearStats.cornerOutlierPct.toFixed(1)}% corner outliers)`
+    const hotspot = cornerHotspots[0];
+    const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
+    const finding = createObservedFinding({
+      category: 'corners',
+      flawType: 'corner wear',
+      severity: severityToFindingSeverity(cornerWearSeverity),
+      metric: `Corner wear index ${cornerWearScore.toFixed(1)} (${wearStats.cornerOutlierPct.toFixed(1)}% corner outliers)`,
+      location: hotspot?.name ?? 'corner region',
+      notes: ['Corner wear is inferred from corner-patch deviation against nearby border reference pixels.', 'Factory corner geometry can limit precision for slight wear.'],
+      measurement: hotspot ? {
+        kind: 'count',
+        value: 1,
+        display: '1 corner hotspot',
+        approximate: true
+      } : undefined,
+      region,
+      evidenceStrength: hotspot && hotspot.score >= 28 ? 'high' : 'medium'
     });
+    addFlawItem('Corner Rounding', cornerWearSeverity, finding.metric, finding);
   }
 
   const toneClippingPct = (stats.shadowClipFrac + stats.highlightClipFrac) * 100;
@@ -1942,12 +2496,24 @@ function detectCanvasPsaStyleFlaws(
         : toneClippingPct > 5 ? 'Slight'
           : 'NONE';
   if (toneSeverity !== 'NONE') {
-    items.push({
-      category: 'Defect',
-      severity: toneSeverity,
-      points: severityToPoints(toneSeverity),
-      metric: `Tone clipping ${toneClippingPct.toFixed(1)}%`
+    const clippedAreaCm2 = (toneClippingPct / 100) * TUNING.cardWidthCm * TUNING.cardHeightCm;
+    const finding = createObservedFinding({
+      category: 'quality',
+      flawType: 'tone clipping / lighting defect',
+      severity: severityToFindingSeverity(toneSeverity),
+      metric: `Tone clipping ${toneClippingPct.toFixed(1)}%`,
+      location: 'overall image',
+      notes: ['This is an image-quality proxy that can hide or exaggerate visible defects.', 'Used conservatively as a front-image observability warning.'],
+      measurement: {
+        kind: 'area_cm2',
+        value: clippedAreaCm2,
+        display: formatAreaCm2(clippedAreaCm2),
+        approximate: true,
+        normalized: toneClippingPct / 100
+      },
+      evidenceStrength: toneClippingPct > 18 ? 'high' : 'medium'
     });
+    addFlawItem('Defect', toneSeverity, finding.metric, finding);
   }
 
   const mapped = assessConditionFromFlaws(items);
@@ -1959,6 +2525,17 @@ function detectCanvasPsaStyleFlaws(
   const calibratedAssessment = shouldApplyReferenceCalibration
     ? pointsToCondition(pointFloorFromReferenceGrade(referenceCalibration.estimatedGrade))
     : mapped;
+  const cornerFindings = detectedFindings.filter((finding) => finding.category === 'corners');
+  const edgeFindings = detectedFindings.filter((finding) => finding.category === 'edges');
+  const surfaceFindings = detectedFindings.filter((finding) => finding.category === 'surface');
+  const shapeFindings: DetectedFinding[] = [];
+  const notReliablyObservable = [
+    'indentation depth and show-through from the reverse',
+    'true gloss loss',
+    'fine print registration defects',
+    'subtle bend, curl, or warp without side-angle evidence',
+    'any reverse-side defects'
+  ];
 
   return {
     totalPoints: mapped.totalPoints,
@@ -1970,6 +2547,12 @@ function detectCanvasPsaStyleFlaws(
     limitingFlaws: shouldApplyReferenceCalibration ? [] : mapped.limitingFlaws,
     gradeCap: calibratedAssessment.gradeCap,
     items,
+    detectedFindings,
+    cornerFindings,
+    edgeFindings,
+    surfaceFindings,
+    shapeFindings,
+    notReliablyObservable,
     debug: {
       blurVariance: stats.blurVariance,
       meanLuma: stats.meanLuma,
@@ -2112,6 +2695,80 @@ function sampleBorderStripStats(
   };
 }
 
+function detectBorderHotspots(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): BorderHotspot[] {
+  if (!bounds || !innerBounds) return [];
+
+  const card = {
+    minX: clampInt(bounds.minX, 0, width - 1),
+    minY: clampInt(bounds.minY, 0, height - 1),
+    maxX: clampInt(bounds.maxX, 0, width - 1),
+    maxY: clampInt(bounds.maxY, 0, height - 1)
+  };
+  const inner = {
+    minX: clampInt(innerBounds.minX, card.minX, card.maxX),
+    minY: clampInt(innerBounds.minY, card.minY, card.maxY),
+    maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
+    maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
+  };
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 760));
+  const hotspots: BorderHotspot[] = [];
+  const segmentSpan = Math.max(14, Math.round(Math.min(width, height) * 0.045));
+
+  const pushSegments = (
+    side: BorderHotspot['side'],
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number,
+    alongAxis: 'x' | 'y'
+  ) => {
+    if (minX > maxX || minY > maxY) return;
+    if (alongAxis === 'x') {
+      for (let startX = minX; startX <= maxX; startX += segmentSpan) {
+        const endX = Math.min(maxX, startX + segmentSpan - 1);
+        const stats = sampleBorderStripStats(px, width, startX, minY, endX, maxY, step);
+        if (!stats) continue;
+        if (stats.outlierPct < 10 && stats.meanDelta < 18) continue;
+        hotspots.push({
+          bounds: { minX: startX, minY, maxX: endX, maxY },
+          side,
+          deviation: stats.meanDelta,
+          outlierPct: stats.outlierPct
+        });
+      }
+      return;
+    }
+
+    for (let startY = minY; startY <= maxY; startY += segmentSpan) {
+      const endY = Math.min(maxY, startY + segmentSpan - 1);
+      const stats = sampleBorderStripStats(px, width, minX, startY, maxX, endY, step);
+      if (!stats) continue;
+      if (stats.outlierPct < 10 && stats.meanDelta < 18) continue;
+      hotspots.push({
+        bounds: { minX, minY: startY, maxX, maxY: endY },
+        side,
+        deviation: stats.meanDelta,
+        outlierPct: stats.outlierPct
+      });
+    }
+  };
+
+  pushSegments('top', card.minX, card.minY, card.maxX, inner.minY - 1, 'x');
+  pushSegments('bottom', card.minX, inner.maxY + 1, card.maxX, card.maxY, 'x');
+  pushSegments('left', card.minX, inner.minY, inner.minX - 1, inner.maxY, 'y');
+  pushSegments('right', inner.maxX + 1, inner.minY, card.maxX, inner.maxY, 'y');
+
+  return hotspots
+    .sort((a, b) => ((b.outlierPct * 1.2) + b.deviation) - ((a.outlierPct * 1.2) + a.deviation))
+    .slice(0, 8);
+}
+
 function analyzeCanvasInteriorDisturbance(
   px: Uint8ClampedArray,
   width: number,
@@ -2121,16 +2778,17 @@ function analyzeCanvasInteriorDisturbance(
   anomalyPerK: number;
   strongPerK: number;
   linearPerK: number;
+  hotspots: InteriorHotspot[];
 } {
   if (!bounds) {
-    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0 };
+    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0, hotspots: [] };
   }
 
   const region = insetBoundsByFrac(bounds, width, height, 0.05);
   const regionWidth = Math.max(1, region.maxX - region.minX + 1);
   const regionHeight = Math.max(1, region.maxY - region.minY + 1);
   if (regionWidth < 12 || regionHeight < 12) {
-    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0 };
+    return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0, hotspots: [] };
   }
 
   const stride = width + 1;
@@ -2139,6 +2797,7 @@ function analyzeCanvasInteriorDisturbance(
   const cols = Math.floor((regionWidth - 1) / step) + 1;
   const rows = Math.floor((regionHeight - 1) / step) + 1;
   const anomalyMarks = new Uint8Array(cols * rows);
+  const linearMarks = new Uint8Array(cols * rows);
   const signals = new Float32Array(cols * rows);
   const smallRadius = Math.max(1, step);
   const largeRadius = clampInt(Math.round(Math.min(regionWidth, regionHeight) * 0.012), smallRadius + 2, 12);
@@ -2190,6 +2849,7 @@ function analyzeCanvasInteriorDisturbance(
 
       if (bestRun >= 4 && signals[index] >= anomalyThreshold + 1.5) {
         linearCount++;
+        linearMarks[index] = 1;
       }
     }
   }
@@ -2197,8 +2857,94 @@ function analyzeCanvasInteriorDisturbance(
   return {
     anomalyPerK: (anomalyCount / Math.max(1, sampleCount)) * 1000,
     strongPerK: (strongCount / Math.max(1, sampleCount)) * 1000,
-    linearPerK: (linearCount / Math.max(1, sampleCount)) * 1000
+    linearPerK: (linearCount / Math.max(1, sampleCount)) * 1000,
+    hotspots: clusterInteriorHotspots(region, cols, rows, step, anomalyMarks, linearMarks, signals, strongThreshold)
   };
+}
+
+function clusterInteriorHotspots(
+  region: ContentBounds,
+  cols: number,
+  rows: number,
+  step: number,
+  anomalyMarks: Uint8Array,
+  linearMarks: Uint8Array,
+  signals: Float32Array,
+  strongThreshold: number
+): InteriorHotspot[] {
+  const visited = new Uint8Array(cols * rows);
+  const hotspots: InteriorHotspot[] = [];
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const startIndex = row * cols + col;
+      if (!anomalyMarks[startIndex] || visited[startIndex]) continue;
+
+      const queue: Array<[number, number]> = [[col, row]];
+      visited[startIndex] = 1;
+      let sampleCount = 0;
+      let strongCount = 0;
+      let linearCount = 0;
+      let maxSignal = 0;
+      let minCol = col;
+      let maxCol = col;
+      let minRow = row;
+      let maxRow = row;
+
+      while (queue.length) {
+        const [currentCol, currentRow] = queue.shift()!;
+        const index = currentRow * cols + currentCol;
+        sampleCount++;
+        if (signals[index] >= strongThreshold) strongCount++;
+        if (linearMarks[index]) linearCount++;
+        if (signals[index] > maxSignal) maxSignal = signals[index];
+        if (currentCol < minCol) minCol = currentCol;
+        if (currentCol > maxCol) maxCol = currentCol;
+        if (currentRow < minRow) minRow = currentRow;
+        if (currentRow > maxRow) maxRow = currentRow;
+
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nextCol = currentCol + dx;
+            const nextRow = currentRow + dy;
+            if (nextCol < 0 || nextCol >= cols || nextRow < 0 || nextRow >= rows) continue;
+            const nextIndex = nextRow * cols + nextCol;
+            if (!anomalyMarks[nextIndex] || visited[nextIndex]) continue;
+            visited[nextIndex] = 1;
+            queue.push([nextCol, nextRow]);
+          }
+        }
+      }
+
+      if (sampleCount < 2) continue;
+      const bounds: ContentBounds = {
+        minX: clampInt(region.minX + (minCol * step) - step, region.minX, region.maxX),
+        minY: clampInt(region.minY + (minRow * step) - step, region.minY, region.maxY),
+        maxX: clampInt(region.minX + (maxCol * step) + step, region.minX, region.maxX),
+        maxY: clampInt(region.minY + (maxRow * step) + step, region.minY, region.maxY)
+      };
+      const hotspotWidth = Math.max(1, bounds.maxX - bounds.minX + 1);
+      const hotspotHeight = Math.max(1, bounds.maxY - bounds.minY + 1);
+      const aspect = Math.max(hotspotWidth / hotspotHeight, hotspotHeight / hotspotWidth);
+      hotspots.push({
+        bounds,
+        sampleCount,
+        strongCount,
+        linearCount,
+        maxSignal,
+        kind: linearCount >= Math.max(2, Math.round(sampleCount * 0.25)) || aspect >= 2.8 ? 'scratch' : 'scuffing'
+      });
+    }
+  }
+
+  return hotspots
+    .sort((a, b) => {
+      const aScore = (a.strongCount * 3) + (a.linearCount * 4) + a.maxSignal;
+      const bScore = (b.strongCount * 3) + (b.linearCount * 4) + b.maxSignal;
+      return bScore - aScore;
+    })
+    .slice(0, 8);
 }
 
 function analyzeCanvasToneBands(
@@ -2583,6 +3329,102 @@ function analyzeCanvasWear(
   };
 }
 
+function detectCornerHotspots(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
+): CornerHotspot[] {
+  if (!bounds || !innerBounds) return [];
+
+  const card = {
+    minX: clampInt(bounds.minX, 0, width - 1),
+    minY: clampInt(bounds.minY, 0, height - 1),
+    maxX: clampInt(bounds.maxX, 0, width - 1),
+    maxY: clampInt(bounds.maxY, 0, height - 1)
+  };
+  const inner = {
+    minX: clampInt(innerBounds.minX, card.minX, card.maxX),
+    minY: clampInt(innerBounds.minY, card.minY, card.maxY),
+    maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
+    maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
+  };
+  const spanX = Math.max(6, Math.round((card.maxX - card.minX + 1) * 0.12));
+  const spanY = Math.max(6, Math.round((card.maxY - card.minY + 1) * 0.12));
+  const referenceDepthX = clampInt(Math.max(2, Math.round((inner.minX - card.minX) * 0.55)), 2, Math.max(2, inner.minX - card.minX));
+  const referenceDepthY = clampInt(Math.max(2, Math.round((inner.minY - card.minY) * 0.55)), 2, Math.max(2, inner.minY - card.minY));
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 480));
+
+  const cornerDefs: Array<{ name: CornerHotspot['name']; minX: number; minY: number; maxX: number; maxY: number; refX: number; refY: number }> = [
+    {
+      name: 'top-left',
+      minX: card.minX,
+      minY: card.minY,
+      maxX: Math.min(card.maxX, card.minX + spanX),
+      maxY: Math.min(card.maxY, card.minY + spanY),
+      refX: Math.min(card.maxX, card.minX + referenceDepthX),
+      refY: Math.min(card.maxY, card.minY + referenceDepthY)
+    },
+    {
+      name: 'top-right',
+      minX: Math.max(card.minX, card.maxX - spanX),
+      minY: card.minY,
+      maxX: card.maxX,
+      maxY: Math.min(card.maxY, card.minY + spanY),
+      refX: Math.max(card.minX, card.maxX - referenceDepthX),
+      refY: Math.min(card.maxY, card.minY + referenceDepthY)
+    },
+    {
+      name: 'bottom-left',
+      minX: card.minX,
+      minY: Math.max(card.minY, card.maxY - spanY),
+      maxX: Math.min(card.maxX, card.minX + spanX),
+      maxY: card.maxY,
+      refX: Math.min(card.maxX, card.minX + referenceDepthX),
+      refY: Math.max(card.minY, card.maxY - referenceDepthY)
+    },
+    {
+      name: 'bottom-right',
+      minX: Math.max(card.minX, card.maxX - spanX),
+      minY: Math.max(card.minY, card.maxY - spanY),
+      maxX: card.maxX,
+      maxY: card.maxY,
+      refX: Math.max(card.minX, card.maxX - referenceDepthX),
+      refY: Math.max(card.minY, card.maxY - referenceDepthY)
+    }
+  ];
+
+  return cornerDefs.map((corner) => {
+    let sampleCount = 0;
+    let deltaSum = 0;
+    let outlierCount = 0;
+    for (let y = corner.minY; y <= corner.maxY; y += step) {
+      for (let x = corner.minX; x <= corner.maxX; x += step) {
+        const referenceX = corner.name.includes('right') ? Math.max(corner.refX, x - referenceDepthX) : Math.min(corner.refX, x + referenceDepthX);
+        const referenceY = corner.name.includes('bottom') ? Math.max(corner.refY, y - referenceDepthY) : Math.min(corner.refY, y + referenceDepthY);
+        const delta = wearDeltaBetweenPixels(px, width, x, y, referenceX, referenceY);
+        deltaSum += delta;
+        sampleCount++;
+        if (delta >= 22) outlierCount++;
+      }
+    }
+
+    const meanDelta = sampleCount ? deltaSum / sampleCount : 0;
+    const outlierPct = sampleCount ? (outlierCount / sampleCount) * 100 : 0;
+    return {
+      name: corner.name,
+      bounds: { minX: corner.minX, minY: corner.minY, maxX: corner.maxX, maxY: corner.maxY },
+      meanDelta,
+      outlierPct,
+      score: (meanDelta * 1.2) + (outlierPct * 0.85)
+    };
+  })
+    .filter((corner) => corner.score >= 18)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+}
+
 function borderWearPoint(
   card: ContentBounds,
   side: 'left' | 'right' | 'top' | 'bottom',
@@ -2775,6 +3617,242 @@ function computeCanvasConfidence(blurVariance: number, meanLuma: number, stdLuma
   const contrastScore = clamp01(stdLuma / 64);
   const boundsScore = hasBounds ? 1 : 0.65;
   return clamp01(0.25 + 0.35 * blurScore + 0.2 * exposureScore + 0.12 * contrastScore + 0.08 * boundsScore);
+}
+
+export function buildCanvasQualityAssessment(args: {
+  stats: ReturnType<typeof computeLumaStats>;
+  sourceWidth: number;
+  sourceHeight: number;
+  cardBounds: ContentBounds | null;
+  innerBounds: ContentBounds | null;
+}): QualityAssessment {
+  const {
+    stats,
+    sourceWidth,
+    sourceHeight,
+    cardBounds,
+    innerBounds
+  } = args;
+  const longEdgePx = Math.max(sourceWidth, sourceHeight);
+  const cardDetected = !!cardBounds;
+  const cardTouchesFrame = !cardBounds
+    ? true
+    : cardBounds.minX <= 2
+      || cardBounds.minY <= 2
+      || cardBounds.maxX >= sourceWidth - 3
+      || cardBounds.maxY >= sourceHeight - 3;
+  const fullFrontVisible = !!cardBounds && !cardTouchesFrame;
+  const cardW = cardBounds ? Math.max(1, cardBounds.maxX - cardBounds.minX + 1) : 0;
+  const cardH = cardBounds ? Math.max(1, cardBounds.maxY - cardBounds.minY + 1) : 0;
+  const areaFrac = cardDetected ? (cardW * cardH) / Math.max(1, sourceWidth * sourceHeight) : 0;
+  const aspectError = cardDetected
+    ? Math.abs(Math.log((cardW / Math.max(1, cardH)) / (TUNING.cardWidthCm / TUNING.cardHeightCm)))
+    : Number.POSITIVE_INFINITY;
+  const clippingPct = (stats.shadowClipFrac + stats.highlightClipFrac) * 100;
+
+  const checks: QualityCheck[] = [
+    {
+      key: 'blur',
+      label: 'Blur',
+      observed: stats.blurVariance < TUNING.blurVarianceThreshold,
+      severity: stats.blurVariance < 18 ? 'high' : stats.blurVariance < 40 ? 'moderate' : stats.blurVariance < TUNING.blurVarianceThreshold ? 'low' : 'none',
+      metric: `Laplacian variance ${stats.blurVariance.toFixed(1)}`,
+      note: 'Blur reduces confidence in corner, edge, and fine surface assessment.',
+      impactsObservability: true
+    },
+    {
+      key: 'glare',
+      label: 'Glare / reflections',
+      observed: clippingPct > 3,
+      severity: clippingPct > 14 ? 'high' : clippingPct > 8 ? 'moderate' : clippingPct > 3 ? 'low' : 'none',
+      metric: `Tone clipping ${clippingPct.toFixed(1)}%`,
+      note: 'Clipped highlights or shadows can hide or exaggerate visible front defects.',
+      impactsObservability: true
+    },
+    {
+      key: 'low_resolution',
+      label: 'Resolution',
+      observed: longEdgePx < 1400,
+      severity: longEdgePx < TUNING.lowResolutionLongEdgePx ? 'high' : longEdgePx < TUNING.moderateResolutionLongEdgePx ? 'moderate' : longEdgePx < 1400 ? 'low' : 'none',
+      metric: `${sourceWidth}x${sourceHeight}px`,
+      note: 'Lower resolution limits detection of slight wear and narrow edge defects.',
+      impactsObservability: true
+    },
+    {
+      key: 'occlusion',
+      label: 'Occlusion',
+      observed: cardDetected && areaFrac < 0.38 && cardTouchesFrame,
+      severity: !cardDetected ? 'high' : areaFrac < 0.28 ? 'high' : areaFrac < 0.38 && cardTouchesFrame ? 'moderate' : 'none',
+      metric: cardDetected ? `Card area ${(areaFrac * 100).toFixed(1)}% of frame` : undefined,
+      note: 'A partially obscured or heavily cropped card image reduces grading reliability.',
+      impactsObservability: true
+    },
+    {
+      key: 'cropping',
+      label: 'Cropping issues',
+      observed: cardTouchesFrame,
+      severity: !cardDetected ? 'high' : cardTouchesFrame ? 'high' : 'none',
+      metric: cardDetected ? `Bounds ${cardW}x${cardH}px` : undefined,
+      note: 'The full front should be visible to evaluate borders and perimeter wear conservatively.',
+      impactsObservability: true
+    },
+    {
+      key: 'perspective',
+      label: 'Perspective distortion',
+      observed: aspectError > 0.06,
+      severity: aspectError > 0.22 ? 'high' : aspectError > 0.12 ? 'moderate' : aspectError > 0.06 ? 'low' : 'none',
+      metric: Number.isFinite(aspectError) ? `Aspect error ${aspectError.toFixed(3)}` : undefined,
+      note: 'Perspective distortion can bias centering measurements if rectification is imperfect.',
+      impactsObservability: true
+    },
+    {
+      key: 'full_front_border',
+      label: 'Full front border visibility',
+      observed: !!innerBounds,
+      severity: innerBounds ? 'none' : 'high',
+      metric: innerBounds ? 'Inner frame detected' : 'Inner frame not detected',
+      note: 'If the front border-to-art transition is not detectable, centering confidence is limited.',
+      impactsObservability: true
+    }
+  ];
+
+  const penalty = checks.reduce((sum, check) => {
+    switch (check.severity) {
+      case 'high':
+        return sum + 0.22;
+      case 'moderate':
+        return sum + 0.12;
+      case 'low':
+        return sum + 0.05;
+      default:
+        return sum;
+    }
+  }, 0);
+  const baseScore = computeCanvasConfidence(stats.blurVariance, stats.meanLuma, stats.stdLuma, !!cardBounds && !!innerBounds);
+  const imageQualityScore = clamp01(baseScore - penalty + (cardDetected ? 0.06 : 0));
+
+  return {
+    readable: cardDetected && stats.blurVariance >= 8 && longEdgePx >= 400,
+    imageQualityScore,
+    blurVariance: stats.blurVariance,
+    meanLuma: stats.meanLuma,
+    stdLuma: stats.stdLuma,
+    resolution: { width: sourceWidth, height: sourceHeight, longEdgePx },
+    cardDetected,
+    fullFrontVisible,
+    checks
+  };
+}
+
+export function observabilityCeilingFromQuality(quality: QualityAssessment): GradeCeilingAssessment {
+  const highCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'high').length;
+  const moderateCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'moderate').length;
+  const lowCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'low').length;
+
+  if (!quality.cardDetected || !quality.readable) {
+    return gradeCapReason('confidence', { gradeLabel: 'PR 1', psaNumeric: 1 }, 'Image quality or card localization is too poor for a reliable front-only estimate.');
+  }
+  if (!quality.fullFrontVisible) {
+    return gradeCapReason('confidence', { gradeLabel: 'EX 5', psaNumeric: 5 }, 'Full front borders are not completely visible, so high-grade outcomes are not supportable.');
+  }
+  if (highCount >= 2) {
+    return gradeCapReason('confidence', { gradeLabel: 'VG-EX 4', psaNumeric: 4 }, 'Multiple severe observability issues make the estimate highly conservative.');
+  }
+  if (highCount === 1) {
+    return gradeCapReason('confidence', { gradeLabel: 'EX-MT 6', psaNumeric: 6 }, 'One severe observability issue limits how high the pre-grade can reasonably go.');
+  }
+  if (moderateCount >= 2) {
+    return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Multiple moderate image-quality issues reduce confidence in slight-defect detection.');
+  }
+  if (moderateCount === 1 || lowCount >= 3) {
+    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'Some observability limits remain, so the estimate is capped conservatively.');
+  }
+  if (lowCount >= 1) {
+    return gradeCapReason('confidence', { gradeLabel: 'MINT 9', psaNumeric: 9 }, 'Minor image-quality limits remain even though the card is generally scorable.');
+  }
+  return gradeCapReason('confidence', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, 'Image quality is strong enough that observability does not materially lower the grade ceiling.');
+}
+
+function buildStructuredGradeReport(args: {
+  imageName?: string;
+  quality: QualityAssessment;
+  centering: CenteringResult | undefined;
+  flaws: FlawResult | undefined;
+  confidenceCeiling: GradeCeilingAssessment;
+  finalGradeLabel: string;
+  finalGradeNumeric: number;
+  confidence: number;
+  assumptions?: string[];
+  limitations?: string[];
+}): StructuredGradeReport {
+  const {
+    imageName,
+    quality,
+    centering,
+    flaws,
+    confidenceCeiling,
+    finalGradeLabel,
+    finalGradeNumeric,
+    confidence,
+    assumptions = [],
+    limitations = []
+  } = args;
+  const centeringCeiling = centering
+    ? gradeCapReason('centering', centering.gradeCap, `Worse front centering axis ${centering.worst.axis} measured ${centering.worst.ratio}.`)
+    : gradeCapReason('centering', { gradeLabel: 'PR 1', psaNumeric: 1 }, 'Centering could not be measured reliably from the provided front image.');
+  const visibleDefectCeiling = flaws
+    ? gradeCapReason(
+      'visible_defect',
+      flaws.gradeCap,
+      flaws.items.length
+        ? `Visible front findings total ${flaws.effectivePoints ?? flaws.totalPoints} rubric points.`
+        : 'No visible front findings crossed the configured thresholds.'
+    )
+    : gradeCapReason('visible_defect', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, 'No visible front defects were evaluated.');
+  const confidenceBand = confidenceBandFromScore(confidence);
+  const qualityIssues = quality.checks.filter((check) => check.severity !== 'none');
+  const detectedDefects = flaws?.detectedFindings ?? [];
+  const topReasons = [
+    centeringCeiling.reason,
+    visibleDefectCeiling.reason,
+    confidenceCeiling.reason,
+    ...summarizeFinding(detectedDefects)
+  ].slice(0, 4);
+  const topChangeDrivers = [
+    ...qualityIssues.map((check) => check.note),
+    ...(flaws?.notReliablyObservable ?? [])
+  ].slice(0, 4);
+  const mergedLimitations = [
+    ...limitations,
+    ...(flaws?.notReliablyObservable ?? [])
+  ];
+
+  return {
+    imageName,
+    cardDetected: quality.cardDetected,
+    fullFrontVisible: quality.fullFrontVisible,
+    imageQuality: quality,
+    frontCenteringLR: centering?.lr.ratio,
+    frontCenteringTB: centering?.tb.ratio,
+    effectiveFrontCentering: centering?.worst.ratio,
+    cornerFindings: flaws?.cornerFindings ?? [],
+    edgeFindings: flaws?.edgeFindings ?? [],
+    surfaceFindings: flaws?.surfaceFindings ?? [],
+    shapeFindings: flaws?.shapeFindings ?? [],
+    detectedDefects,
+    defectPointsTotal: flaws?.effectivePoints ?? flaws?.totalPoints ?? 0,
+    centeringGradeCeiling: centeringCeiling,
+    visibleDefectGradeCeiling: visibleDefectCeiling,
+    confidenceGradeCeiling: confidenceCeiling,
+    finalGradeLabel,
+    finalGradeNumeric,
+    confidenceBand,
+    manualReviewRequired: confidenceBand !== 'high' || qualityIssues.length > 0 || !quality.fullFrontVisible,
+    assumptions,
+    limitations: mergedLimitations,
+    topReasons,
+    topChangeDrivers
+  };
 }
 
 // =========================

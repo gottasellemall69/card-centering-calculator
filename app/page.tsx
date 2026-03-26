@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import Papa from 'papaparse';
 
 import type { GradeResult } from '@/lib/grader';
 import { OverlayViewer, type ManualCenteringView } from '@/components/OverlayViewer';
+import { flattenGradeResult, serializeGradeRowsToCsv } from '@/lib/resultExport';
 import { finalGradeFromCaps } from '@/lib/rubric';
 
 type RowStatus = 'PENDING' | 'PREPARING' | 'REVIEW' | 'PROCESSING' | 'SAVING' | 'DONE' | 'ERROR';
@@ -571,25 +571,8 @@ export default function Page() {
   const downloadCSV = () => {
     const data = rows
       .filter(hasSavedResult)
-      .map((row) => {
-        const result = row.result;
-        return {
-          filename: row.filename,
-          grade: result.final.gradeLabel,
-          psa: result.final.psaNumeric,
-          confidence: result.final.confidence,
-          unscorable: result.final.unscorable ? 'YES' : 'NO',
-          unscorableReasons: result.final.unscorableReasons?.map((reason) => reason.code).join('|') ?? '',
-          centeringLR: result.centering?.lr?.ratio ?? '',
-          centeringTB: result.centering?.tb?.ratio ?? '',
-          centeringWorst: result.centering?.worst?.ratio ?? '',
-          centeringCap: result.centering?.gradeCap?.psaNumeric ?? '',
-          flawPoints: result.flaws?.totalPoints ?? '',
-          flawCap: result.flaws?.gradeCap?.psaNumeric ?? ''
-        };
-      });
-
-    const csv = Papa.unparse(data);
+      .map((row) => flattenGradeResult(row.filename, row.result));
+    const csv = serializeGradeRowsToCsv(data);
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -814,7 +797,7 @@ export default function Page() {
                 <div className="small">
                   {displayedResult
                     ? displayedResult.final.unscorable
-                      ? `UNSCORABLE (${displayedResult.final.unscorableReasons?.map((reason) => reason.code).join(', ')})`
+                      ? `UNSCORABLE (${displayedResult.final.unscorableReasons?.map((reason) => reason.code)?.join(', ') ?? 'manual review required'})`
                       : `${displayedResult.final.gradeLabel} (PSA ${displayedResult.final.psaNumeric})`
                     : 'Review the guides, then run the estimate for the final grade and flaw summary.'}
                 </div>
@@ -889,6 +872,8 @@ export default function Page() {
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Estimate</h3>
                 <div className="kv"><div className="small">Grade</div><div>{displayedResult.final.gradeLabel} (PSA {displayedResult.final.psaNumeric})</div></div>
                 <div className="kv"><div className="small">Confidence</div><div>{displayedResult.final.confidence.toFixed(2)}</div></div>
+                <div className="kv"><div className="small">Confidence band</div><div>{displayedResult.report?.confidenceBand ?? '-'}</div></div>
+                <div className="kv"><div className="small">Manual review</div><div>{displayedResult.report?.manualReviewRequired ? 'YES' : 'NO'}</div></div>
                 <div className="kv"><div className="small">Condition</div><div>{displayedResult.flaws?.condition ?? '-'}</div></div>
                 <div className="kv"><div className="small">Flaw cap</div><div>{displayedResult.flaws?.gradeCap?.gradeLabel ?? '-'}</div></div>
                 <div className="kv"><div className="small">Flaw profile</div><div>{displayedResult.flaws?.psaProfile ?? '-'}</div></div>
@@ -899,13 +884,51 @@ export default function Page() {
                       ? '-'
                       : displayedResult.flaws.effectivePoints && displayedResult.flaws.effectivePoints !== displayedResult.flaws.totalPoints
                         ? `${displayedResult.flaws.totalPoints} raw / ${displayedResult.flaws.effectivePoints} rubric`
-                        : displayedResult.flaws.totalPoints}
+                      : displayedResult.flaws.totalPoints}
                   </div>
+                </div>
+
+                <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Image quality</h3>
+                <div className="kv"><div className="small">Card detected</div><div>{displayedResult.report?.cardDetected ? 'YES' : 'NO'}</div></div>
+                <div className="kv"><div className="small">Full front visible</div><div>{displayedResult.report?.fullFrontVisible ? 'YES' : 'NO'}</div></div>
+                <div className="kv"><div className="small">Quality score</div><div>{displayedResult.report ? displayedResult.report.imageQuality.imageQualityScore.toFixed(2) : '-'}</div></div>
+                <div className="small" style={{ marginTop: 8 }}>
+                  {displayedResult.report?.imageQuality.checks?.some((check) => check.severity !== 'none') ? (
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                      {displayedResult.report?.imageQuality.checks?.filter((check) => check.severity !== 'none')?.map((check) => (
+                          <li key={check.key}>
+                            <b>{check.label}</b>: {check.severity.toUpperCase()} {check.metric ? `(${check.metric})` : ''} - {check.note}
+                          </li>
+                        ))}
+                    </ul>
+                  ) : (
+                    'No image-quality warnings were emitted.'
+                  )}
+                </div>
+
+                <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Grade ceilings</h3>
+                <div className="kv"><div className="small">Centering ceiling</div><div>{displayedResult.report?.centeringGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+                <div className="kv"><div className="small">Visible-defect ceiling</div><div>{displayedResult.report?.visibleDefectGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+                <div className="kv"><div className="small">Observability ceiling</div><div>{displayedResult.report?.confidenceGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+                <div className="small" style={{ marginTop: 8 }}>
+                  {displayedResult.report?.topReasons?.length
+                    ? displayedResult.report?.topReasons?.join(' | ')
+                    : 'No supporting reasons available.'}
                 </div>
 
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Flaws</h3>
                 <div className="small" style={{ marginTop: 8 }}>
-                  {displayedResult.flaws?.items?.length ? (
+                  {displayedResult.report?.detectedDefects?.length ? (
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                      {displayedResult.report?.detectedDefects?.map((item) => (
+                        <li key={item.id}>
+                          <b>{item.flawType}</b>: {item.severity} at {item.location}, evidence {item.evidenceStrength}
+                          {item.measurement ? `, ${item.measurement.display}` : ''}
+                          {` - ${item.metric}`}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : displayedResult.flaws?.items?.length ? (
                     <ul style={{ margin: 0, paddingLeft: 18 }}>
                       {displayedResult.flaws.items.map((item, index) => (
                         <li key={index}>
@@ -922,6 +945,13 @@ export default function Page() {
                     Matrix floor applied from {displayedResult.flaws.limitingFlaws.map((item) => `${item.category} ${item.severity}`).join(', ')}.
                   </div>
                 ) : null}
+
+                <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Could change with better evidence</h3>
+                <div className="small">
+                  {displayedResult.report?.topChangeDrivers?.length
+                    ? displayedResult.report?.topChangeDrivers?.join(' | ')
+                    : 'No additional change drivers were recorded.'}
+                </div>
               </>
             ) : (
               <>
@@ -934,8 +964,9 @@ export default function Page() {
 
             <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Assumptions and limitations</h3>
             <div className="small">
-              This is a photo-based heuristic grader. It can miss micro-scratches, print texture issues, gloss loss, and very subtle corner wear.
-              Heavy glare, blur, or non-uniform lighting can cause false positives. Review the measurement guides before estimating the grade.
+              {displayedResult?.report?.limitations?.length
+                ? displayedResult.report?.limitations?.join(' | ')
+                : 'This is a photo-based heuristic grader. It can miss micro-scratches, print texture issues, gloss loss, and very subtle corner wear. Heavy glare, blur, or non-uniform lighting can cause false positives.'}
             </div>
           </>
         )}
@@ -949,7 +980,15 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
     return result;
   }
 
-  const finalCap = finalGradeFromCaps(manualCentering.gradeCap, result.flaws.gradeCap);
+  const confidenceCap = result.report?.confidenceGradeCeiling.cap ?? { gradeLabel: 'GEM-MT 10' as const, psaNumeric: 10 };
+  const centeringAndFlawCap = finalGradeFromCaps(manualCentering.gradeCap, result.flaws.gradeCap);
+  const finalCap = finalGradeFromCaps(centeringAndFlawCap, confidenceCap);
+  const updatedTopReasons = [
+    `${manualCentering.gradeCap.gradeLabel}: Manual centering override uses ${manualCentering.worst.axis} ${manualCentering.worst.ratio}.`,
+    result.report?.visibleDefectGradeCeiling.reason,
+    result.report?.confidenceGradeCeiling.reason
+  ].filter((value): value is string => !!value);
+
   return {
     ...result,
     centering: manualCentering,
@@ -958,6 +997,20 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
       gradeLabel: finalCap.gradeLabel,
       psaNumeric: finalCap.psaNumeric
     },
+    report: result.report ? {
+      ...result.report,
+      frontCenteringLR: manualCentering.lr.ratio,
+      frontCenteringTB: manualCentering.tb.ratio,
+      effectiveFrontCentering: manualCentering.worst.ratio,
+      centeringGradeCeiling: {
+        source: 'centering',
+        cap: manualCentering.gradeCap,
+        reason: `${manualCentering.gradeCap.gradeLabel}: Manual centering override uses ${manualCentering.worst.axis} ${manualCentering.worst.ratio}.`
+      },
+      finalGradeLabel: finalCap.gradeLabel,
+      finalGradeNumeric: finalCap.psaNumeric,
+      topReasons: updatedTopReasons
+    } : result.report,
     debug: {
       ...(result.debug ?? {}),
       manualCenteringApplied: true,
