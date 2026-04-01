@@ -1,7 +1,7 @@
-import { gradeCardFrontCanvasOnly, prepareCardFrontCanvasOnly, type GradeResult } from '@/lib/grader';
+import { gradeCardFrontCanvasOnly, prepareCardFrontCanvasOnly, type GradeResult, type ManualGuideOverride } from '@/lib/grader';
 
 type PrepareRequestMessage = { type: 'PREPARE'; id: string; file: File; };
-type GradeRequestMessage = { type: 'GRADE'; id: string; file: File; };
+type GradeRequestMessage = { type: 'GRADE'; id: string; file: File; manualGuideOverride?: ManualGuideOverride | null; };
 type GradeRequestMessageAny = PrepareRequestMessage | GradeRequestMessage;
 type PrepareDoneMessage = {
   type: 'PREPARED';
@@ -12,8 +12,8 @@ type GradeDoneMessage = {
   type: 'DONE';
   id: string;
   result: GradeResult;
-  overlayPNG: string;
-  rectifiedPNG: string;
+  overlayBlob: Blob;
+  rectifiedBlob: Blob;
 };
 type GradeErrorMessage = { type: 'ERROR'; id: string; error: string; };
 type GradeResponseMessage = PrepareDoneMessage | GradeDoneMessage | GradeErrorMessage;
@@ -36,13 +36,20 @@ ctx.onmessage = async (event: MessageEvent<GradeRequestMessageAny>) => {
       return;
     }
 
-    const { result, overlayPNG, rectifiedPNG } = await gradeCardFrontCanvasOnly(message.file);
+    const { result, overlayPNG, rectifiedPNG } = await gradeCardFrontCanvasOnly(
+      message.file,
+      message.manualGuideOverride ?? null
+    );
+    const [overlayBlob, rectifiedBlob] = await Promise.all([
+      dataUrlToBlob(overlayPNG),
+      dataUrlToBlob(rectifiedPNG)
+    ]);
     const done: GradeResponseMessage = {
       type: 'DONE',
       id: message.id,
       result,
-      overlayPNG,
-      rectifiedPNG
+      overlayBlob,
+      rectifiedBlob
     };
     ctx.postMessage(done);
   } catch (error) {
@@ -54,5 +61,13 @@ ctx.onmessage = async (event: MessageEvent<GradeRequestMessageAny>) => {
     ctx.postMessage(failed);
   }
 };
+
+async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
+  const response = await fetch(dataUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to decode worker artifact (${response.status}).`);
+  }
+  return response.blob();
+}
 
 export {};

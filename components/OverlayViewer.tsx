@@ -58,12 +58,14 @@ export function OverlayViewer( {
   const [ guides, setGuides ] = useState<GuideState | null>( null );
   const [ dragKey, setDragKey ] = useState<GuideKey | null>( null );
   const [ normalization, setNormalization ] = useState<ImageNormalization>( DEFAULT_NORMALIZATION );
+  const [ normalizationAnchor, setNormalizationAnchor ] = useState<{ x: number; y: number; } | null>( null );
 
   useEffect( () => {
     setImageSize( null );
     setGuides( null );
     setDragKey( null );
     setNormalization( DEFAULT_NORMALIZATION );
+    setNormalizationAnchor( null );
   }, [ imageDataUrl ] );
 
   useEffect( () => {
@@ -75,6 +77,15 @@ export function OverlayViewer( {
     if ( !guides || !imageSize ) return;
     onCenteringChange?.( buildManualCentering( guides.cardBounds, guides.innerBounds, imageSize.w, imageSize.h ) );
   }, [ guides, imageSize, onCenteringChange ] );
+
+  useEffect( () => {
+    if ( !guides ) return;
+    const center = getBoundsCenter( guides.cardBounds );
+    setNormalizationAnchor( ( current ) => {
+      if ( !current ) return center;
+      return isIdentityNormalization( normalization ) ? center : current;
+    } );
+  }, [ guides, normalization ] );
 
   useEffect( () => {
     if ( !dragKey || !imageSize ) return;
@@ -103,9 +114,12 @@ export function OverlayViewer( {
     ? buildManualCentering( guides.cardBounds, guides.innerBounds, imageSize.w, imageSize.h )
     : null;
   const cardSize = guides ? getBoundsSize( guides.cardBounds ) : null;
-  const cardTransform = cardSize ? buildImageTransform( cardSize, normalization ) : IDENTITY_MATRIX;
+  const cardTransform = imageSize ? buildImageTransform( imageSize, normalization ) : IDENTITY_MATRIX;
+  const cardTransformOrigin = normalizationAnchor && imageSize
+    ? `${ toXPercent( normalizationAnchor.x, imageSize.w ) }% ${ toYPercent( normalizationAnchor.y, imageSize.h ) }%`
+    : '50% 50%';
   const cardTransformStyle: CSSProperties = {
-    transformOrigin: '50% 50%',
+    transformOrigin: cardTransformOrigin,
     transform: matrixToCss( cardTransform )
   };
   const hasNormalization = !isIdentityNormalization( normalization );
@@ -117,18 +131,33 @@ export function OverlayViewer( {
       height: `${ toSpanPercent( cardSize.h, imageSize.h ) }%`
     }
     : undefined;
-  const cardImageStyle: CSSProperties | undefined = guides && imageSize && cardSize
+  const cardClipPath = guides && imageSize
+    ? buildBoundsClipPath( guides.cardBounds, imageSize )
+    : null;
+  const cardClipStyle: CSSProperties | undefined = cardClipPath
     ? {
-      width: `${ ( imageSize.w / Math.max( 1, cardSize.w ) ) * 100 }%`,
-      height: `${ ( imageSize.h / Math.max( 1, cardSize.h ) ) * 100 }%`,
-      left: `${ -( guides.cardBounds.minX / Math.max( 1, cardSize.w ) ) * 100 }%`,
-      top: `${ -( guides.cardBounds.minY / Math.max( 1, cardSize.h ) ) * 100 }%`
+      left: 0,
+      top: 0,
+      width: '100%',
+      height: '100%',
+      background: 'transparent',
+      boxShadow: 'none',
+      borderRadius: 0,
+      clipPath: cardClipPath,
+      WebkitClipPath: cardClipPath
     }
     : undefined;
+  const cardImageStyle: CSSProperties = {
+    left: 0,
+    top: 0,
+    width: '100%',
+    height: '100%'
+  };
 
   const resetGuides = () => {
     if ( !imageSize ) return;
     setDragKey( null );
+    setNormalizationAnchor( null );
     setGuides( resolveInitialGuides( result, imageSize, manualCentering ?? null ) );
   };
   const resetNormalization = () => setNormalization( DEFAULT_NORMALIZATION );
@@ -222,10 +251,10 @@ export function OverlayViewer( {
               }}
             />
 
-            {guides && imageSize && cardSize && cardCropStyle && cardImageStyle ? (
+            {guides && imageSize && cardSize && cardCropStyle && cardClipStyle ? (
               <>
                 <div className="overlayViewerCardBackdrop" aria-hidden="true" style={cardCropStyle} />
-                <div className="overlayViewerCardShell" aria-hidden="true" style={cardCropStyle}>
+                <div className="overlayViewerCardShell" aria-hidden="true" style={cardClipStyle}>
                   <div className="overlayViewerCardLayer" style={cardTransformStyle}>
                     <img
                       className="overlayViewerCardImage"
@@ -663,8 +692,8 @@ function buildManualCentering(
       innerRect: {
         x: inner.minX,
         y: inner.minY,
-        w: Math.max( 1, inner.maxX - inner.minX ),
-        h: Math.max( 1, inner.maxY - inner.minY )
+        w: Math.max( 1, inner.maxX - inner.minX + 1 ),
+        h: Math.max( 1, inner.maxY - inner.minY + 1 )
       }
     },
     mm: {
@@ -679,11 +708,12 @@ function buildManualCentering(
 function rectToBounds( rect: { x: number; y: number; w: number; h: number; } | undefined ): BoundsRect | null {
   if ( !rect ) return null;
   if ( ![ rect.x, rect.y, rect.w, rect.h ].every( ( value ) => Number.isFinite( value ) ) ) return null;
+  if ( rect.w < 1 || rect.h < 1 ) return null;
   return {
     minX: rect.x,
     minY: rect.y,
-    maxX: rect.x + rect.w,
-    maxY: rect.y + rect.h
+    maxX: ( rect.x + rect.w ) - 1,
+    maxY: ( rect.y + rect.h ) - 1
   };
 }
 
@@ -840,6 +870,21 @@ function getBoundsSize( bounds: BoundsRect ): { w: number; h: number; } {
     w: Math.max( 1, bounds.maxX - bounds.minX + 1 ),
     h: Math.max( 1, bounds.maxY - bounds.minY + 1 )
   };
+}
+
+function getBoundsCenter( bounds: BoundsRect ): { x: number; y: number; } {
+  return {
+    x: ( bounds.minX + bounds.maxX ) / 2,
+    y: ( bounds.minY + bounds.maxY ) / 2
+  };
+}
+
+function buildBoundsClipPath( bounds: BoundsRect, imageSize: { w: number; h: number; } ): string {
+  const left = toXEdgePercent( bounds.minX, imageSize.w );
+  const top = toYEdgePercent( bounds.minY, imageSize.h );
+  const right = toXEdgePercent( bounds.maxX + 1, imageSize.w );
+  const bottom = toYEdgePercent( bounds.maxY + 1, imageSize.h );
+  return `polygon(${ left }% ${ top }%, ${ right }% ${ top }%, ${ right }% ${ bottom }%, ${ left }% ${ bottom }%)`;
 }
 
 function toXPercent( value: number, width: number ): number {

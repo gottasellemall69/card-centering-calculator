@@ -7,7 +7,6 @@ import {
   assessConditionFromFlaws,
   centeringCapFromWorstSidePct,
   finalGradeFromCaps,
-  pointsToCondition,
   severityToPoints,
   type FlawCategory,
   type GradeCap,
@@ -198,6 +197,14 @@ export type GradeResult = {
   debug?: Record<string, unknown>;
 };
 
+export type GuideRect = { x: number; y: number; w: number; h: number };
+
+export type ManualGuideOverride = {
+  sourceSize: { w: number; h: number };
+  cardRect: GuideRect;
+  innerRect: GuideRect;
+};
+
 // =========================
 // Tunable constants
 // =========================
@@ -283,40 +290,6 @@ export const TUNING = {
   cornerRadiusMajorPx: 28
 };
 
-type VintageReferenceFeatureVector = {
-  grade: number;
-  innerMeanLuma: number;
-  innerStdLuma: number;
-  borderToneSpread: number;
-  interiorStrongPerK: number;
-  interiorLinearPerK: number;
-  borderStdLuma: number;
-};
-
-const VINTAGE_REFERENCE_FALLBACK_VECTORS: readonly VintageReferenceFeatureVector[] = [
-  { grade: 1, innerMeanLuma: 127.9, innerStdLuma: 57.5, borderToneSpread: 46.81, interiorStrongPerK: 180.03, interiorLinearPerK: 176.16, borderStdLuma: 73.7 },
-  { grade: 2, innerMeanLuma: 140.2, innerStdLuma: 55.3, borderToneSpread: 64.54, interiorStrongPerK: 172.06, interiorLinearPerK: 166.43, borderStdLuma: 72.8 },
-  { grade: 3, innerMeanLuma: 129.5, innerStdLuma: 56.2, borderToneSpread: 68.44, interiorStrongPerK: 177.73, interiorLinearPerK: 172.56, borderStdLuma: 74.4 },
-  { grade: 4, innerMeanLuma: 146.0, innerStdLuma: 56.3, borderToneSpread: 9.99, interiorStrongPerK: 178.77, interiorLinearPerK: 177.59, borderStdLuma: 78.8 },
-  { grade: 5, innerMeanLuma: 141.5, innerStdLuma: 56.7, borderToneSpread: 32.91, interiorStrongPerK: 175.57, interiorLinearPerK: 165.72, borderStdLuma: 76.7 },
-  { grade: 6, innerMeanLuma: 139.6, innerStdLuma: 54.9, borderToneSpread: 33.54, interiorStrongPerK: 177.97, interiorLinearPerK: 174.24, borderStdLuma: 78.7 },
-  { grade: 7, innerMeanLuma: 139.5, innerStdLuma: 55.6, borderToneSpread: 31.53, interiorStrongPerK: 181.34, interiorLinearPerK: 170.39, borderStdLuma: 79.6 },
-  { grade: 8, innerMeanLuma: 160.9, innerStdLuma: 50.0, borderToneSpread: 28.58, interiorStrongPerK: 162.77, interiorLinearPerK: 157.65, borderStdLuma: 65.7 },
-  { grade: 9, innerMeanLuma: 157.0, innerStdLuma: 54.3, borderToneSpread: 13.46, interiorStrongPerK: 162.28, interiorLinearPerK: 158.7, borderStdLuma: 66.0 },
-  { grade: 10, innerMeanLuma: 155.5, innerStdLuma: 53.9, borderToneSpread: 21.57, interiorStrongPerK: 161.76, interiorLinearPerK: 153.31, borderStdLuma: 69.2 }
-] as const;
-
-const VINTAGE_REFERENCE_FEATURE_WEIGHTS = {
-  innerMeanLuma: 1.0,
-  innerStdLuma: 0.65,
-  borderToneSpread: 0.7,
-  interiorStrongPerK: 0.75,
-  interiorLinearPerK: 0.9,
-  borderStdLuma: 0.45
-} as const;
-
-let vintageReferenceVectorsPromise: Promise<readonly VintageReferenceFeatureVector[]> | null = null;
-
 let cvPromise: Promise<any> | null = null;
 async function getCV(): Promise<any> {
   if (!cvPromise) {
@@ -333,13 +306,16 @@ async function getCV(): Promise<any> {
 const PERSPECTIVE_NORMALIZATION_TIMEOUT_MS = 5000;
 let perspectiveNormalizationDisabled = false;
 const ENABLE_PERSPECTIVE_NORMALIZATION = false;
-const CROPSCALE_PADDING_FRAC = 0;
+const CROPSCALE_PADDING_FRAC = 0.04;
 
 // =========================
 // Public API
 // =========================
-export async function gradeCardFront(file: File): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
-  const graded = await analyzeCardFrontCanvasFallback(file, 'Defaulted to canvas grading pipeline', 'grade');
+export async function gradeCardFront(
+  file: File,
+  manualGuideOverride?: ManualGuideOverride | null
+): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
+  const graded = await analyzeCardFrontCanvasFallback(file, 'Defaulted to canvas grading pipeline', 'grade', manualGuideOverride ?? null);
   return ensureCanvasGradeArtifacts(graded);
 }
 
@@ -348,8 +324,11 @@ export async function prepareCardFrontCanvasOnly(file: File): Promise<{ result: 
   return { result: prepared.result };
 }
 
-export async function gradeCardFrontCanvasOnly(file: File): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
-  const graded = await analyzeCardFrontCanvasFallback(file, 'Forced canvas fallback', 'grade');
+export async function gradeCardFrontCanvasOnly(
+  file: File,
+  manualGuideOverride?: ManualGuideOverride | null
+): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
+  const graded = await analyzeCardFrontCanvasFallback(file, 'Forced canvas fallback', 'grade', manualGuideOverride ?? null);
   return ensureCanvasGradeArtifacts(graded);
 }
 
@@ -444,7 +423,8 @@ async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; 
 async function analyzeCardFrontCanvasFallback(
   file: File,
   cause: unknown,
-  mode: 'prepare' | 'grade'
+  mode: 'prepare' | 'grade',
+  manualGuideOverride: ManualGuideOverride | null = null
 ): Promise<{ result: GradeResult; overlayPNG?: string; rectifiedPNG?: string }> {
   const bmp = await createImageBitmap(file);
   const longEdge = Math.max(bmp.width, bmp.height);
@@ -462,18 +442,26 @@ async function analyzeCardFrontCanvasFallback(
   const sourceImageData = baseCtx.getImageData(0, 0, width, height);
   const sourcePx = sourceImageData.data;
 
+  const manualGuideBounds = mode === 'grade'
+    ? resolveManualGuideOverrideBounds(manualGuideOverride, width, height)
+    : null;
   const borderColor = estimateBorderColor(sourcePx, width, height);
   const colorBounds = estimateContentBounds(sourcePx, width, height, borderColor);
   const profileBounds = detectOuterCardBounds(sourcePx, width, height);
-  const cardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height);
+  const autoCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height);
+  const cardBounds = manualGuideBounds?.cardBounds ?? autoCardBounds;
   const sourceCardBounds = cardBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
-  const paddedSourceCardBounds = expandBounds(sourceCardBounds, width, height, CROPSCALE_PADDING_FRAC);
-  const aspectAlignedSourceCardBounds = fitBoundsToAspect(
-    paddedSourceCardBounds,
-    width,
-    height,
-    TUNING.cardWidthCm / TUNING.cardHeightCm
-  );
+  const paddedSourceCardBounds = manualGuideBounds
+    ? sourceCardBounds
+    : expandBounds(sourceCardBounds, width, height, CROPSCALE_PADDING_FRAC);
+  const aspectAlignedSourceCardBounds = manualGuideBounds
+    ? sourceCardBounds
+    : fitBoundsToAspect(
+      paddedSourceCardBounds,
+      width,
+      height,
+      TUNING.cardWidthCm / TUNING.cardHeightCm
+    );
 
   const normalizedWidth = TUNING.rectifiedWidthPx;
   const normalizedHeight = TUNING.rectifiedHeightPx;
@@ -486,7 +474,7 @@ async function analyzeCardFrontCanvasFallback(
   let selectedSourceCardBounds: ContentBounds = aspectAlignedSourceCardBounds;
   let perspectiveError: string | null = null;
 
-  if (ENABLE_PERSPECTIVE_NORMALIZATION && !perspectiveNormalizationDisabled) {
+  if (!manualGuideBounds && ENABLE_PERSPECTIVE_NORMALIZATION && !perspectiveNormalizationDisabled) {
     try {
       const perspectiveNormalized = await withTimeout(
         tryPerspectiveNormalizeWithOpenCV(sourceImageData),
@@ -525,7 +513,7 @@ async function analyzeCardFrontCanvasFallback(
 
   const normalizedImageData = normalizedCtx.getImageData(0, 0, normalizedWidth, normalizedHeight);
   const normalizedPx = normalizedImageData.data;
-  const normalizedCardBounds: ContentBounds = normalizationMethod === 'opencv_perspective'
+  const normalizedMappedCardBounds: ContentBounds = normalizationMethod === 'opencv_perspective'
     ? {
       minX: 0,
       minY: 0,
@@ -534,21 +522,61 @@ async function analyzeCardFrontCanvasFallback(
     }
     : mapBoundsToNormalizedSpace(
       sourceCardBounds,
-      aspectAlignedSourceCardBounds,
+      selectedSourceCardBounds,
       normalizedWidth,
       normalizedHeight
     );
-  const innerBounds = detectInnerContentBounds(normalizedPx, normalizedWidth, normalizedHeight, normalizedCardBounds);
-  const centering = buildCanvasCentering(normalizedCardBounds, innerBounds, normalizedWidth, normalizedHeight);
+  const normalizedBorderColor = estimateBorderColor(normalizedPx, normalizedWidth, normalizedHeight);
+  const normalizedColorBounds = estimateContentBounds(normalizedPx, normalizedWidth, normalizedHeight, normalizedBorderColor);
+  const normalizedProfileBounds = detectOuterCardBounds(normalizedPx, normalizedWidth, normalizedHeight);
+  const normalizedDetectedCardBounds = chooseBestCardBounds(
+    normalizedColorBounds,
+    normalizedProfileBounds,
+    normalizedWidth,
+    normalizedHeight
+  );
+  const normalizedBorderConfidence = manualGuideBounds
+    ? manualGuideBorderConfidence(normalizedMappedCardBounds, normalizedWidth, normalizedHeight)
+    : assessNormalizedBorderConfidence({
+      normalizationMethod,
+      width: normalizedWidth,
+      height: normalizedHeight,
+      expectedBounds: normalizedMappedCardBounds,
+      detectedBounds: normalizedDetectedCardBounds
+    });
+  const normalizedCardBounds = manualGuideBounds
+    ? normalizedMappedCardBounds
+    : chooseBestCardBounds(
+      normalizedMappedCardBounds,
+      normalizedDetectedCardBounds,
+      normalizedWidth,
+      normalizedHeight
+    ) ?? normalizedMappedCardBounds;
+  const manualNormalizedInnerBounds = manualGuideBounds
+    ? mapBoundsToNormalizedSpace(
+      manualGuideBounds.innerBounds,
+      selectedSourceCardBounds,
+      normalizedWidth,
+      normalizedHeight
+    )
+    : null;
+  const autoInnerBounds = detectInnerContentBounds(normalizedPx, normalizedWidth, normalizedHeight, normalizedCardBounds);
+  const innerBounds = manualNormalizedInnerBounds
+    ? clampInnerBoundsToCardBounds(manualNormalizedInnerBounds, normalizedCardBounds)
+    : autoInnerBounds;
+  const centeringPreview = buildCanvasCentering(normalizedCardBounds, innerBounds, normalizedWidth, normalizedHeight);
+  const centering = innerBounds ? centeringPreview : undefined;
   const sourceStats = computeLumaStats(sourcePx, width, height);
   const qualityAssessment = buildCanvasQualityAssessment({
     stats: sourceStats,
     sourceWidth: width,
     sourceHeight: height,
     cardBounds,
-    innerBounds
+    innerBounds,
+    borderConfidence: normalizedBorderConfidence
   });
   const confidenceCeiling = observabilityCeilingFromQuality(qualityAssessment);
+  const unscorableReasons = buildCanvasUnscorableReasons(qualityAssessment, innerBounds);
 
   const baseDebug = {
     fallback: true,
@@ -561,26 +589,48 @@ async function analyzeCardFrontCanvasFallback(
     normalizedSize: { w: normalizedWidth, h: normalizedHeight },
     colorBounds,
     profileBounds,
+    normalizedColorBounds,
+    normalizedProfileBounds,
+    autoCardBounds,
+    manualGuideOverride,
+    manualGuideBounds,
+    manualGuideOverrideApplied: !!manualGuideBounds,
     cardBounds: sourceCardBounds,
     cropBounds: selectedSourceCardBounds,
     perspectiveQuad,
+    normalizedMappedCardBounds,
+    normalizedDetectedCardBounds,
     normalizedCardBounds,
+    normalizedBorderConfidence,
     innerBounds,
     qualityAssessment,
     confidenceCeiling,
+    unscorableReasons,
     psaStyle: {
-      centering: {
-        lr: centering.lr.ratio,
-        tb: centering.tb.ratio,
-        centeringCap: centering.gradeCap
+      centering: centering
+        ? {
+          lr: centering.lr.ratio,
+          tb: centering.tb.ratio,
+          centeringCap: centering.gradeCap
+        }
+        : {
+          unavailable: true,
+          reason: 'Inner border-to-art transition was not detected reliably for scoring.'
+        },
+      centeringPreview: {
+        lr: centeringPreview.lr.ratio,
+        tb: centeringPreview.tb.ratio,
+        centeringCap: centeringPreview.gradeCap
       }
     }
   };
 
   if (mode === 'prepare') {
-    const previewCap = finalGradeFromCaps(centering.gradeCap, confidenceCeiling.cap);
+    const previewCenteringCap = centering?.gradeCap ?? { gradeLabel: 'PR 1', psaNumeric: 1 };
+    const previewCap = finalGradeFromCaps(previewCenteringCap, confidenceCeiling.cap);
+    const previewCentering = centering ?? centeringPreview;
     const result: GradeResult = {
-      centering,
+      centering: previewCentering,
       final: {
         unscorable: false,
         gradeLabel: previewCap.gradeLabel,
@@ -590,7 +640,7 @@ async function analyzeCardFrontCanvasFallback(
       report: buildStructuredGradeReport({
         imageName: file.name,
         quality: qualityAssessment,
-        centering,
+        centering: previewCentering,
         flaws: undefined,
         confidenceCeiling,
         finalGradeLabel: previewCap.gradeLabel,
@@ -603,7 +653,8 @@ async function analyzeCardFrontCanvasFallback(
         ],
         limitations: [
           'Back-side defects are intentionally excluded.',
-          'Manual guide adjustment may still be needed before grading.'
+          'Manual guide adjustment may still be needed before grading.',
+          ...(centering ? [] : ['Inner border detection is currently low confidence; preview centering uses a conservative fallback guide.'])
         ]
       }),
       debug: baseDebug
@@ -611,16 +662,15 @@ async function analyzeCardFrontCanvasFallback(
     return { result };
   }
 
-  const referenceVectors = await getVintageReferenceVectors();
   const flaws = detectCanvasPsaStyleFlaws(
     normalizedPx,
     normalizedWidth,
     normalizedHeight,
     normalizedCardBounds,
-    innerBounds,
-    referenceVectors
+    innerBounds
   );
-  const centeringAndFlawCap = finalGradeFromCaps(centering.gradeCap, flaws.gradeCap);
+  const centeringCap = centering?.gradeCap ?? { gradeLabel: 'PR 1', psaNumeric: 1 };
+  const centeringAndFlawCap = finalGradeFromCaps(centeringCap, flaws.gradeCap);
   const finalCap = finalGradeFromCaps(centeringAndFlawCap, confidenceCeiling.cap);
   const confidence = clamp01((computeCanvasConfidence(
     flaws.debug.blurVariance,
@@ -628,6 +678,9 @@ async function analyzeCardFrontCanvasFallback(
     flaws.debug.stdLuma,
     !!innerBounds
   ) * 0.55) + (qualityAssessment.imageQualityScore * 0.45));
+  const unscorable = unscorableReasons.length > 0;
+  const gradedLabel = unscorable ? 'UNSCORABLE' : finalCap.gradeLabel;
+  const gradedNumeric = unscorable ? 0 : finalCap.psaNumeric;
 
   const result: GradeResult = {
     centering,
@@ -649,9 +702,10 @@ async function analyzeCardFrontCanvasFallback(
       notReliablyObservable: flaws.notReliablyObservable
     },
     final: {
-      unscorable: false,
-      gradeLabel: finalCap.gradeLabel,
-      psaNumeric: finalCap.psaNumeric,
+      unscorable,
+      unscorableReasons: unscorable ? unscorableReasons : undefined,
+      gradeLabel: gradedLabel,
+      psaNumeric: gradedNumeric,
       confidence
     },
     report: buildStructuredGradeReport({
@@ -676,8 +730,8 @@ async function analyzeCardFrontCanvasFallback(
         notReliablyObservable: flaws.notReliablyObservable
       },
       confidenceCeiling,
-      finalGradeLabel: finalCap.gradeLabel,
-      finalGradeNumeric: finalCap.psaNumeric,
+      finalGradeLabel: gradedLabel,
+      finalGradeNumeric: gradedNumeric,
       confidence,
       assumptions: [
         'Front image only.',
@@ -686,7 +740,8 @@ async function analyzeCardFrontCanvasFallback(
       ],
       limitations: [
         'This is a conservative automated pre-grade, not an official grading outcome.',
-        'Glare, blur, and crop quality can materially change the estimate.'
+        'Glare, blur, and crop quality can materially change the estimate.',
+        ...(unscorable ? ['One or more required front-image grading prerequisites were not met.'] : [])
       ]
     }),
     debug: {
@@ -701,7 +756,7 @@ async function analyzeCardFrontCanvasFallback(
         })),
         flawDebug: flaws.debug,
         finalCaps: {
-          centering: centering.gradeCap,
+          centering: centeringCap,
           visibleDefect: flaws.gradeCap,
           confidence: confidenceCeiling.cap,
           final: finalCap
@@ -713,6 +768,7 @@ async function analyzeCardFrontCanvasFallback(
   const overlayCanvas = createProcessingCanvas(normalizedWidth, normalizedHeight);
   const overlayCtx = overlayCanvas.getContext('2d');
   if (!overlayCtx) throw new Error('Canvas 2D not available');
+  const overlayCentering = centering ?? centeringPreview;
 
   renderMeasurementOverlay(
     overlayCtx,
@@ -720,7 +776,7 @@ async function analyzeCardFrontCanvasFallback(
     normalizedHeight,
     normalizedCardBounds,
     innerBounds,
-    centering,
+    overlayCentering,
     result,
     normalizationMethod
   );
@@ -772,129 +828,6 @@ async function tryPerspectiveNormalizeWithOpenCV(
   }
 }
 
-async function getVintageReferenceVectors(): Promise<readonly VintageReferenceFeatureVector[]> {
-  if (!vintageReferenceVectorsPromise) {
-    vintageReferenceVectorsPromise = loadVintageReferenceVectors().catch(() => VINTAGE_REFERENCE_FALLBACK_VECTORS);
-  }
-  return vintageReferenceVectorsPromise;
-}
-
-async function loadVintageReferenceVectors(): Promise<readonly VintageReferenceFeatureVector[]> {
-  if (typeof fetch !== 'function' || typeof createImageBitmap !== 'function' || typeof File === 'undefined') {
-    return VINTAGE_REFERENCE_FALLBACK_VECTORS;
-  }
-
-  const grades = VINTAGE_REFERENCE_FALLBACK_VECTORS.map((entry) => entry.grade);
-  const settled = await Promise.allSettled(
-    grades.map(async (grade) => {
-      const response = await fetch(resolvePublicAssetUrl(`/images/Grades/${grade}.jpg`), { cache: 'force-cache' });
-      if (!response.ok) {
-        throw new Error(`Failed to load reference grade ${grade}.`);
-      }
-
-      const blob = await response.blob();
-      const sample = await extractVintageReferenceSampleFromFile(
-        new File([blob], `${grade}.jpg`, { type: blob.type || 'image/png' })
-      );
-      if (!sample) {
-        throw new Error(`Could not extract features for reference grade ${grade}.`);
-      }
-
-      return { grade, ...sample };
-    })
-  );
-
-  const loaded = settled
-    .filter((result): result is PromiseFulfilledResult<VintageReferenceFeatureVector> => result.status === 'fulfilled')
-    .map((result) => result.value)
-    .sort((a, b) => a.grade - b.grade);
-
-  return loaded.length >= Math.max(5, Math.ceil(grades.length * 0.6))
-    ? loaded
-    : VINTAGE_REFERENCE_FALLBACK_VECTORS;
-}
-
-function resolvePublicAssetUrl(path: string): string {
-  if (typeof location !== 'undefined' && location.origin && location.origin !== 'null') {
-    return new URL(path, location.origin).toString();
-  }
-  return path;
-}
-
-async function extractVintageReferenceSampleFromFile(
-  file: File
-): Promise<Omit<VintageReferenceFeatureVector, 'grade'> | null> {
-  const bmp = await createImageBitmap(file);
-  try {
-    const longEdge = Math.max(bmp.width, bmp.height);
-    const scale = longEdge > TUNING.maxInputLongEdgePx ? TUNING.maxInputLongEdgePx / longEdge : 1;
-    const width = Math.max(1, Math.round(bmp.width * scale));
-    const height = Math.max(1, Math.round(bmp.height * scale));
-
-    const baseCanvas = createProcessingCanvas(width, height);
-    const baseCtx = baseCanvas.getContext('2d');
-    if (!baseCtx) return null;
-
-    baseCtx.drawImage(bmp, 0, 0, width, height);
-    const sourceImageData = baseCtx.getImageData(0, 0, width, height);
-    const sourcePx = sourceImageData.data;
-
-    const borderColor = estimateBorderColor(sourcePx, width, height);
-    const colorBounds = estimateContentBounds(sourcePx, width, height, borderColor);
-    const profileBounds = detectOuterCardBounds(sourcePx, width, height);
-    const sourceCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height)
-      ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
-    const paddedSourceCardBounds = expandBounds(sourceCardBounds, width, height, CROPSCALE_PADDING_FRAC);
-    const aspectAlignedSourceCardBounds = fitBoundsToAspect(
-      paddedSourceCardBounds,
-      width,
-      height,
-      TUNING.cardWidthCm / TUNING.cardHeightCm
-    );
-
-    const normalizedCanvas = createProcessingCanvas(TUNING.rectifiedWidthPx, TUNING.rectifiedHeightPx);
-    const normalizedCtx = normalizedCanvas.getContext('2d');
-    if (!normalizedCtx) return null;
-
-    normalizedCtx.drawImage(
-      baseCanvas as CanvasImageSource,
-      aspectAlignedSourceCardBounds.minX,
-      aspectAlignedSourceCardBounds.minY,
-      Math.max(1, aspectAlignedSourceCardBounds.maxX - aspectAlignedSourceCardBounds.minX + 1),
-      Math.max(1, aspectAlignedSourceCardBounds.maxY - aspectAlignedSourceCardBounds.minY + 1),
-      0,
-      0,
-      TUNING.rectifiedWidthPx,
-      TUNING.rectifiedHeightPx
-    );
-
-    const normalizedImageData = normalizedCtx.getImageData(0, 0, TUNING.rectifiedWidthPx, TUNING.rectifiedHeightPx);
-    const normalizedPx = normalizedImageData.data;
-    const normalizedCardBounds = mapBoundsToNormalizedSpace(
-      sourceCardBounds,
-      aspectAlignedSourceCardBounds,
-      TUNING.rectifiedWidthPx,
-      TUNING.rectifiedHeightPx
-    );
-    const innerBounds = detectInnerContentBounds(
-      normalizedPx,
-      TUNING.rectifiedWidthPx,
-      TUNING.rectifiedHeightPx,
-      normalizedCardBounds
-    );
-
-    return extractVintageReferenceSample(
-      normalizedPx,
-      TUNING.rectifiedWidthPx,
-      TUNING.rectifiedHeightPx,
-      normalizedCardBounds,
-      innerBounds
-    );
-  } finally {
-    if ('close' in bmp) bmp.close();
-  }
-}
-
 function expandBounds(bounds: ContentBounds, width: number, height: number, frac: number): ContentBounds {
   if (frac <= 0) return bounds;
   const w = Math.max(1, bounds.maxX - bounds.minX + 1);
@@ -936,6 +869,57 @@ function mapBoundsToNormalizedSpace(
     minY + 1,
     Math.max(1, normalizedHeight - 1)
   );
+  return { minX, minY, maxX, maxY };
+}
+
+function resolveManualGuideOverrideBounds(
+  override: ManualGuideOverride | null | undefined,
+  targetWidth: number,
+  targetHeight: number
+): { cardBounds: ContentBounds; innerBounds: ContentBounds; sourceSize: { w: number; h: number } } | null {
+  if (!override) return null;
+  const sourceW = Number(override.sourceSize?.w);
+  const sourceH = Number(override.sourceSize?.h);
+  if (!Number.isFinite(sourceW) || !Number.isFinite(sourceH) || sourceW <= 2 || sourceH <= 2) return null;
+
+  const cardBounds = scaleGuideRectToBounds(override.cardRect, sourceW, sourceH, targetWidth, targetHeight);
+  const innerBoundsRaw = scaleGuideRectToBounds(override.innerRect, sourceW, sourceH, targetWidth, targetHeight);
+  if (!cardBounds || !innerBoundsRaw) return null;
+
+  return {
+    cardBounds,
+    innerBounds: clampInnerBoundsToCardBounds(innerBoundsRaw, cardBounds),
+    sourceSize: { w: sourceW, h: sourceH }
+  };
+}
+
+function scaleGuideRectToBounds(
+  rect: GuideRect | null | undefined,
+  sourceW: number,
+  sourceH: number,
+  targetW: number,
+  targetH: number
+): ContentBounds | null {
+  if (!rect) return null;
+  const x = Number(rect.x);
+  const y = Number(rect.y);
+  const w = Number(rect.w);
+  const h = Number(rect.h);
+  if (![x, y, w, h].every((value) => Number.isFinite(value))) return null;
+  if (w <= 1 || h <= 1) return null;
+
+  const minX = clampInt((x / Math.max(1, sourceW)) * targetW, 0, Math.max(0, targetW - 2));
+  const minY = clampInt((y / Math.max(1, sourceH)) * targetH, 0, Math.max(0, targetH - 2));
+  const maxX = clampInt((((x + w) / Math.max(1, sourceW)) * targetW) - 1, minX + 1, Math.max(1, targetW - 1));
+  const maxY = clampInt((((y + h) / Math.max(1, sourceH)) * targetH) - 1, minY + 1, Math.max(1, targetH - 1));
+  return { minX, minY, maxX, maxY };
+}
+
+function clampInnerBoundsToCardBounds(innerBounds: ContentBounds, cardBounds: ContentBounds): ContentBounds {
+  const minX = clampInt(innerBounds.minX, cardBounds.minX, Math.max(cardBounds.minX, cardBounds.maxX - 1));
+  const minY = clampInt(innerBounds.minY, cardBounds.minY, Math.max(cardBounds.minY, cardBounds.maxY - 1));
+  const maxX = clampInt(innerBounds.maxX, minX + 1, cardBounds.maxX);
+  const maxY = clampInt(innerBounds.maxY, minY + 1, cardBounds.maxY);
   return { minX, minY, maxX, maxY };
 }
 
@@ -1574,12 +1558,148 @@ function overlapFraction(a: ContentBounds, b: ContentBounds): number {
   return intersection / minArea;
 }
 
+type BorderConfidenceAssessment = {
+  confidence: number; // 0..1, higher is better
+  severity: 'none' | 'low' | 'moderate' | 'high';
+  metric: string;
+  note: string;
+  expectedBounds: ContentBounds | null;
+  detectedBounds: ContentBounds | null;
+  overlap: number | null;
+  areaRatio: number | null;
+  expectedTouchesFrame: boolean;
+  detectedTouchesFrame: boolean;
+};
+
+function manualGuideBorderConfidence(
+  mappedBounds: ContentBounds,
+  width: number,
+  height: number
+): BorderConfidenceAssessment {
+  const touchesFrame = touchesFrameBounds(mappedBounds, width, height, 2);
+  return {
+    confidence: 1,
+    severity: 'none',
+    metric: `manual guide override, touches frame ${touchesFrame ? 'YES' : 'NO'}`,
+    note: 'Using user-adjusted overlay guides as the authoritative card and inner-frame boundaries.',
+    expectedBounds: mappedBounds,
+    detectedBounds: mappedBounds,
+    overlap: 1,
+    areaRatio: 1,
+    expectedTouchesFrame: touchesFrame,
+    detectedTouchesFrame: touchesFrame
+  };
+}
+
+function assessNormalizedBorderConfidence(args: {
+  normalizationMethod: 'opencv_perspective' | 'crop_scale';
+  width: number;
+  height: number;
+  expectedBounds: ContentBounds | null;
+  detectedBounds: ContentBounds | null;
+}): BorderConfidenceAssessment {
+  const {
+    normalizationMethod,
+    width,
+    height,
+    expectedBounds,
+    detectedBounds
+  } = args;
+  const expectedTouchesFrame = touchesFrameBounds(expectedBounds, width, height, 2);
+  const detectedTouchesFrame = touchesFrameBounds(detectedBounds, width, height, 2);
+  const overlap = expectedBounds && detectedBounds
+    ? overlapFraction(expectedBounds, detectedBounds)
+    : null;
+  const areaRatio = expectedBounds && detectedBounds
+    ? boundsArea(detectedBounds) / Math.max(1, boundsArea(expectedBounds))
+    : null;
+
+  let penalty = 0;
+
+  if (!detectedBounds) {
+    penalty += normalizationMethod === 'crop_scale' ? 0.65 : 0.35;
+  } else if (overlap != null && areaRatio != null) {
+    if (overlap < 0.60) penalty += 0.52;
+    else if (overlap < 0.72) penalty += 0.36;
+    else if (overlap < 0.84) penalty += 0.18;
+    else if (overlap < 0.90) penalty += 0.08;
+
+    if (areaRatio < 0.72 || areaRatio > 1.34) penalty += 0.42;
+    else if (areaRatio < 0.84 || areaRatio > 1.20) penalty += 0.22;
+    else if (areaRatio < 0.92 || areaRatio > 1.12) penalty += 0.08;
+  }
+
+  if (normalizationMethod === 'crop_scale' && detectedTouchesFrame && !expectedTouchesFrame) {
+    // Detected outer border touching normalized frame is a strong clipping warning.
+    penalty += 0.35;
+  }
+  if (normalizationMethod === 'opencv_perspective' && expectedTouchesFrame && !detectedTouchesFrame) {
+    // When perspective output should fill the frame but detected borders sit inward, edge mapping is suspect.
+    penalty += 0.28;
+  }
+
+  const confidence = clamp01(1 - penalty);
+  const severity: BorderConfidenceAssessment['severity'] =
+    confidence < 0.50 ? 'high'
+      : confidence < 0.66 ? 'moderate'
+        : confidence < 0.80 ? 'low'
+          : 'none';
+
+  const metric = [
+    `confidence ${(confidence * 100).toFixed(0)}%`,
+    `overlap ${overlap == null ? 'n/a' : `${(overlap * 100).toFixed(1)}%`}`,
+    `area ratio ${areaRatio == null ? 'n/a' : areaRatio.toFixed(2)}`,
+    `detected touches frame ${detectedTouchesFrame ? 'YES' : 'NO'}`
+  ].join(', ');
+
+  const note = severity === 'high'
+    ? 'Detected outer-border geometry is inconsistent with the normalized card bounds; centering and border-based scoring are unsafe.'
+    : severity === 'moderate'
+      ? 'Outer-border confidence is reduced; centering may be biased.'
+      : severity === 'low'
+        ? 'Outer-border fit is mostly consistent, with minor mismatch.'
+        : 'Outer-border fit is consistent with normalized card bounds.';
+
+  return {
+    confidence,
+    severity,
+    metric,
+    note,
+    expectedBounds,
+    detectedBounds,
+    overlap,
+    areaRatio,
+    expectedTouchesFrame,
+    detectedTouchesFrame
+  };
+}
+
+function boundsArea(bounds: ContentBounds): number {
+  return Math.max(1, (bounds.maxX - bounds.minX + 1) * (bounds.maxY - bounds.minY + 1));
+}
+
+function touchesFrameBounds(
+  bounds: ContentBounds | null,
+  width: number,
+  height: number,
+  pad: number
+): boolean {
+  if (!bounds) return true;
+  return (
+    bounds.minX <= pad
+    || bounds.minY <= pad
+    || bounds.maxX >= width - 1 - pad
+    || bounds.maxY >= height - 1 - pad
+  );
+}
+
 function detectInnerContentBounds(
   px: Uint8ClampedArray,
   width: number,
   height: number,
   cardBounds: ContentBounds | null
 ): ContentBounds | null {
+  // Centering is measured from the outer card edge to the first stable inner design/frame boundary.
   const base = cardBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
   const regionW = base.maxX - base.minX + 1;
   const regionH = base.maxY - base.minY + 1;
@@ -1600,22 +1720,22 @@ function detectInnerContentBounds(
   const minInsetY = clampInt(Math.round(regionH * 0.006), 1, 4);
 
   const leftBorders = ySamples
-    .map((y) => scanBorderTransition(px, width, base, y, 'left', maxBorderX, minInsetX))
+    .map((y) => detectInnerEdgeDistanceForSample(px, width, base, y, 'left', maxBorderX, minInsetX))
     .filter((v): v is number => v != null);
   const rightBorders = ySamples
-    .map((y) => scanBorderTransition(px, width, base, y, 'right', maxBorderX, minInsetX))
+    .map((y) => detectInnerEdgeDistanceForSample(px, width, base, y, 'right', maxBorderX, minInsetX))
     .filter((v): v is number => v != null);
   const topBorders = xSamples
-    .map((x) => scanBorderTransition(px, width, base, x, 'top', maxBorderY, minInsetY))
+    .map((x) => detectInnerEdgeDistanceForSample(px, width, base, x, 'top', maxBorderY, minInsetY))
     .filter((v): v is number => v != null);
   const bottomBorders = xSamples
-    .map((x) => scanBorderTransition(px, width, base, x, 'bottom', maxBorderY, minInsetY))
+    .map((x) => detectInnerEdgeDistanceForSample(px, width, base, x, 'bottom', maxBorderY, minInsetY))
     .filter((v): v is number => v != null);
 
-  const leftBorder = dominantClusterMedian(leftBorders);
-  const rightBorder = dominantClusterMedian(rightBorders);
-  const topBorder = dominantClusterMedian(topBorders);
-  const bottomBorder = dominantClusterMedian(bottomBorders);
+  const leftBorder = robustBorderDistance(leftBorders, ySamples.length, maxBorderX);
+  const rightBorder = robustBorderDistance(rightBorders, ySamples.length, maxBorderX);
+  const topBorder = robustBorderDistance(topBorders, xSamples.length, maxBorderY);
+  const bottomBorder = robustBorderDistance(bottomBorders, xSamples.length, maxBorderY);
 
   if (leftBorder == null || rightBorder == null || topBorder == null || bottomBorder == null) {
     return detectInnerContentBoundsByGradientProfiles(px, width, height, base);
@@ -1780,11 +1900,96 @@ function scanBorderTransition(
   return fallbackDistance;
 }
 
-function dominantClusterMedian(values: number[]): number | null {
-  const sorted = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+function scanBorderTransitionByGradient(
+  px: Uint8ClampedArray,
+  width: number,
+  bounds: ContentBounds,
+  fixedCoord: number,
+  side: 'left' | 'right' | 'top' | 'bottom',
+  maxBorder: number,
+  minInset: number
+): number | null {
+  const samples = collectEdgeScanSamples(px, width, bounds, fixedCoord, side, maxBorder, minInset);
+  if (samples.length < 8) return null;
+
+  const smoothLuma = smoothProfile(samples.map((sample) => sample.luma), 2);
+  const grad = new Array<number>(samples.length).fill(0);
+  for (let i = 1; i < samples.length; i++) {
+    grad[i] = Math.abs(smoothLuma[i] - smoothLuma[i - 1]);
+  }
+
+  const referenceCount = clampInt(Math.round(samples.length * 0.2), 4, Math.max(4, Math.min(14, samples.length - 4)));
+  if (referenceCount >= samples.length - 3) return null;
+
+  const baseGradNoise = averageNumber(grad.slice(1, referenceCount));
+  const edgeThreshold = Math.max(5, baseGradNoise * 2.6 + 3);
+  const minContrast = Math.max(4, edgeThreshold * 0.5);
+
+  let bestIndex: number | null = null;
+  let bestScore = 0;
+
+  for (let i = referenceCount; i <= samples.length - 4; i++) {
+    const localGrad = grad[i];
+    if (localGrad < edgeThreshold * 0.8) continue;
+
+    const beforeStart = Math.max(0, i - 3);
+    const beforeEnd = i;
+    const afterStart = i + 1;
+    const afterEnd = Math.min(samples.length, i + 4);
+    if (beforeEnd - beforeStart < 2 || afterEnd - afterStart < 2) continue;
+
+    const beforeMean = averageNumber(smoothLuma.slice(beforeStart, beforeEnd));
+    const afterMean = averageNumber(smoothLuma.slice(afterStart, afterEnd));
+    const contrast = Math.abs(afterMean - beforeMean);
+    const localEnergy = averageNumber(grad.slice(i, Math.min(samples.length, i + 3)));
+    if (contrast < minContrast && localGrad < edgeThreshold) continue;
+
+    const score = (localGrad * 0.6) + (localEnergy * 0.25) + (contrast * 0.45);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  return bestIndex == null ? null : samples[bestIndex].distanceFromEdge;
+}
+
+function detectInnerEdgeDistanceForSample(
+  px: Uint8ClampedArray,
+  width: number,
+  bounds: ContentBounds,
+  fixedCoord: number,
+  side: 'left' | 'right' | 'top' | 'bottom',
+  maxBorder: number,
+  minInset: number
+): number | null {
+  const colorCandidate = scanBorderTransition(px, width, bounds, fixedCoord, side, maxBorder, minInset);
+  const gradientCandidate = scanBorderTransitionByGradient(px, width, bounds, fixedCoord, side, maxBorder, minInset);
+  if (colorCandidate == null && gradientCandidate == null) return null;
+  if (colorCandidate == null) return gradientCandidate;
+  if (gradientCandidate == null) return colorCandidate;
+
+  const diff = Math.abs(colorCandidate - gradientCandidate);
+  if (diff <= 3) return (colorCandidate + gradientCandidate) / 2;
+
+  // For centering, prefer the first strong border->design transition from the outer edge inward.
+  return Math.min(colorCandidate, gradientCandidate);
+}
+
+function robustBorderDistance(values: number[], expectedSampleCount: number, maxBorder: number): number | null {
+  const sorted = values
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
   if (sorted.length === 0) return null;
-  const windowSize = Math.max(3, Math.ceil(sorted.length * 0.6));
+
+  const minSupport = Math.max(6, Math.floor(expectedSampleCount * 0.42));
+  if (sorted.length < minSupport) return null;
+
+  const windowSize = Math.max(4, Math.ceil(sorted.length * 0.58));
   if (sorted.length <= windowSize) {
+    const span = sorted[sorted.length - 1] - sorted[0];
+    const spanFrac = span / Math.max(1, maxBorder);
+    if (spanFrac > 0.28) return null;
     return medianOfSorted(sorted);
   }
 
@@ -1799,8 +2004,12 @@ function dominantClusterMedian(values: number[]): number | null {
     }
   }
 
-  const data = sorted.slice(bestStart, bestStart + windowSize);
-  return medianOfSorted(data);
+  const clustered = sorted.slice(bestStart, bestStart + windowSize);
+  const support = clustered.length / Math.max(1, expectedSampleCount);
+  const span = clustered[clustered.length - 1] - clustered[0];
+  const spanFrac = span / Math.max(1, maxBorder);
+  if (support < 0.38 || spanFrac > 0.28) return null;
+  return medianOfSorted(clustered);
 }
 
 function medianOfSorted(sorted: number[]): number | null {
@@ -2005,7 +2214,7 @@ export function buildCanvasCentering(
       rectifiedSize: { w: width, h: height },
       border: { leftPx, rightPx, topPx, bottomPx, leftPct, rightPct, topPct, bottomPct },
       cardRect: { x: card.minX, y: card.minY, w: cardW, h: cardH },
-      innerRect: { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) }
+      innerRect: { x: minX, y: minY, w: Math.max(1, maxX - minX + 1), h: Math.max(1, maxY - minY + 1) }
     }
   };
 }
@@ -2161,8 +2370,7 @@ export function detectCanvasPsaStyleFlaws(
   width: number,
   height: number,
   bounds: ContentBounds | null,
-  innerBounds: ContentBounds | null,
-  referenceVectors: readonly VintageReferenceFeatureVector[] = VINTAGE_REFERENCE_FALLBACK_VECTORS
+  innerBounds: ContentBounds | null
 ): {
   totalPoints: number;
   effectivePoints: number;
@@ -2206,10 +2414,6 @@ export function detectCanvasPsaStyleFlaws(
     borderStdLuma: number;
     agingPenalty: number;
     cleanSceneBonus: number;
-    referenceEstimate: number;
-    referenceNearestGrade: number;
-    referenceConfidence: number;
-    referenceDistance: number;
     scuffScore: number;
     scratchScore: number;
     toneClippingPct: number;
@@ -2392,8 +2596,7 @@ export function detectCanvasPsaStyleFlaws(
     addFlawItem('Scuffing', scuffSeverity, finding.metric, finding);
   }
 
-  // Vintage example calibration: card grade separation is driven more by border dirt,
-  // stains, and uneven wear than by absolute scan warmth.
+  // Surface wear proxy based on border cleanliness and tonal spread on the detected card.
   const surfaceWearSeverity: Severity =
     borderCleanlinessScore > 54 ? 'Moderate'
       : borderCleanlinessScore > 36 ? 'Minor'
@@ -2517,14 +2720,6 @@ export function detectCanvasPsaStyleFlaws(
   }
 
   const mapped = assessConditionFromFlaws(items);
-  const referenceCalibration = estimateVintageReferenceCalibration(
-    extractVintageReferenceSample(px, width, height, bounds, innerBounds),
-    referenceVectors
-  );
-  const shouldApplyReferenceCalibration = referenceCalibration.confidence >= 0.35;
-  const calibratedAssessment = shouldApplyReferenceCalibration
-    ? pointsToCondition(pointFloorFromReferenceGrade(referenceCalibration.estimatedGrade))
-    : mapped;
   const cornerFindings = detectedFindings.filter((finding) => finding.category === 'corners');
   const edgeFindings = detectedFindings.filter((finding) => finding.category === 'edges');
   const surfaceFindings = detectedFindings.filter((finding) => finding.category === 'surface');
@@ -2539,13 +2734,13 @@ export function detectCanvasPsaStyleFlaws(
 
   return {
     totalPoints: mapped.totalPoints,
-    effectivePoints: calibratedAssessment.effectivePoints,
-    condition: calibratedAssessment.condition,
-    pointCondition: calibratedAssessment.pointCondition,
-    matrixCondition: shouldApplyReferenceCalibration ? calibratedAssessment.matrixCondition : mapped.matrixCondition,
-    psaProfile: calibratedAssessment.psaProfile,
-    limitingFlaws: shouldApplyReferenceCalibration ? [] : mapped.limitingFlaws,
-    gradeCap: calibratedAssessment.gradeCap,
+    effectivePoints: mapped.effectivePoints,
+    condition: mapped.condition,
+    pointCondition: mapped.pointCondition,
+    matrixCondition: mapped.matrixCondition,
+    psaProfile: mapped.psaProfile,
+    limitingFlaws: mapped.limitingFlaws,
+    gradeCap: mapped.gradeCap,
     items,
     detectedFindings,
     cornerFindings,
@@ -2576,10 +2771,6 @@ export function detectCanvasPsaStyleFlaws(
       borderStdLuma: toneBands.borderStdLuma,
       agingPenalty,
       cleanSceneBonus,
-      referenceEstimate: referenceCalibration.estimatedGrade,
-      referenceNearestGrade: referenceCalibration.nearestGrade,
-      referenceConfidence: referenceCalibration.confidence,
-      referenceDistance: referenceCalibration.nearestDistance,
       scuffScore,
       scratchScore,
       toneClippingPct
@@ -3061,113 +3252,6 @@ function mergeLumaStats(
   };
 }
 
-function extractVintageReferenceSample(
-  px: Uint8ClampedArray,
-  width: number,
-  height: number,
-  bounds: ContentBounds | null,
-  innerBounds: ContentBounds | null
-): Omit<VintageReferenceFeatureVector, 'grade'> {
-  const borderStats = analyzeCanvasBorderCleanliness(px, width, height, bounds, innerBounds);
-  const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, innerBounds ?? bounds);
-  const toneBands = analyzeCanvasToneBands(px, width, height, bounds, innerBounds);
-
-  return {
-    innerMeanLuma: toneBands.innerMeanLuma,
-    innerStdLuma: toneBands.innerStdLuma,
-    borderToneSpread: borderStats.toneSpread,
-    interiorStrongPerK: interiorStats.strongPerK,
-    interiorLinearPerK: interiorStats.linearPerK,
-    borderStdLuma: toneBands.borderStdLuma
-  };
-}
-
-function estimateVintageReferenceCalibration(sample: {
-  innerMeanLuma: number;
-  innerStdLuma: number;
-  borderToneSpread: number;
-  interiorStrongPerK: number;
-  interiorLinearPerK: number;
-  borderStdLuma: number;
-}, referenceVectors: readonly VintageReferenceFeatureVector[] = VINTAGE_REFERENCE_FALLBACK_VECTORS): {
-  estimatedGrade: number;
-  nearestGrade: number;
-  confidence: number;
-  nearestDistance: number;
-} {
-  const featureKeys = Object.keys(VINTAGE_REFERENCE_FEATURE_WEIGHTS) as Array<keyof typeof VINTAGE_REFERENCE_FEATURE_WEIGHTS>;
-  const featureStats = featureKeys.map((key) => {
-    const values = referenceVectors.map((entry) => entry[key]);
-    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const variance = values.reduce((sum, value) => sum + ((value - mean) * (value - mean)), 0) / values.length;
-    return { key, std: Math.max(1e-6, Math.sqrt(variance)) };
-  });
-
-  const distances = referenceVectors.map((entry) => {
-    const distanceSq = featureStats.reduce((sum, feature) => {
-      const sampleValue = sample[feature.key];
-      const refValue = entry[feature.key];
-      const normalizedDelta = (sampleValue - refValue) / feature.std;
-      return sum + (VINTAGE_REFERENCE_FEATURE_WEIGHTS[feature.key] * normalizedDelta * normalizedDelta);
-    }, 0);
-    return {
-      distance: Math.sqrt(distanceSq),
-      grade: entry.grade
-    };
-  }).sort((a, b) => a.distance - b.distance);
-
-  const nearest = distances[0];
-  const runnerUp = distances[1];
-  const weightedNeighbors = distances.slice(0, 4);
-  const weightedGrade = weightedNeighbors.reduce((sum, neighbor) => {
-    const weight = 1 / ((neighbor.distance * neighbor.distance) + 0.05);
-    return sum + (weight * neighbor.grade);
-  }, 0) / weightedNeighbors.reduce((sum, neighbor) => {
-    const weight = 1 / ((neighbor.distance * neighbor.distance) + 0.05);
-    return sum + weight;
-  }, 0);
-  const nearestDistance = nearest?.distance ?? Number.POSITIVE_INFINITY;
-  const separation = runnerUp ? runnerUp.distance - nearestDistance : nearestDistance;
-  const separationConfidence = clamp01(separation / 0.9);
-  const nearestGrade = nearest?.grade ?? 1;
-  const estimatedGrade = nearestDistance <= 0.24
-    ? nearestGrade
-    : clampNumber((weightedGrade * (1 - separationConfidence * 0.35)) + (nearestGrade * separationConfidence * 0.35), 1, 10);
-
-  return {
-    estimatedGrade,
-    nearestGrade,
-    confidence: clamp01((1 - (nearestDistance / 3)) * 0.8 + separationConfidence * 0.2),
-    nearestDistance
-  };
-}
-
-function pointFloorFromReferenceGrade(estimate: number): number {
-  const roundedGrade = clampInt(Math.round(estimate), 1, 10);
-  switch (roundedGrade) {
-    case 10:
-      return 0;
-    case 9:
-      return 1;
-    case 8:
-      return 2;
-    case 7:
-      return 3;
-    case 6:
-      return 5;
-    case 5:
-      return 7;
-    case 4:
-      return 10;
-    case 3:
-      return 14;
-    case 2:
-      return 19;
-    default:
-      return 28;
-  }
-}
-
 function insetBoundsByFrac(bounds: ContentBounds, width: number, height: number, frac: number): ContentBounds {
   if (frac <= 0) return bounds;
   const padX = Math.max(1, Math.round((bounds.maxX - bounds.minX + 1) * frac));
@@ -3625,13 +3709,15 @@ export function buildCanvasQualityAssessment(args: {
   sourceHeight: number;
   cardBounds: ContentBounds | null;
   innerBounds: ContentBounds | null;
+  borderConfidence: BorderConfidenceAssessment;
 }): QualityAssessment {
   const {
     stats,
     sourceWidth,
     sourceHeight,
     cardBounds,
-    innerBounds
+    innerBounds,
+    borderConfidence
   } = args;
   const longEdgePx = Math.max(sourceWidth, sourceHeight);
   const cardDetected = !!cardBounds;
@@ -3641,7 +3727,8 @@ export function buildCanvasQualityAssessment(args: {
       || cardBounds.minY <= 2
       || cardBounds.maxX >= sourceWidth - 3
       || cardBounds.maxY >= sourceHeight - 3;
-  const fullFrontVisible = !!cardBounds && !cardTouchesFrame;
+  const borderReliabilityLow = borderConfidence.severity === 'high';
+  const fullFrontVisible = !!cardBounds && !cardTouchesFrame && !borderReliabilityLow;
   const cardW = cardBounds ? Math.max(1, cardBounds.maxX - cardBounds.minX + 1) : 0;
   const cardH = cardBounds ? Math.max(1, cardBounds.maxY - cardBounds.minY + 1) : 0;
   const areaFrac = cardDetected ? (cardW * cardH) / Math.max(1, sourceWidth * sourceHeight) : 0;
@@ -3708,10 +3795,16 @@ export function buildCanvasQualityAssessment(args: {
     {
       key: 'full_front_border',
       label: 'Full front border visibility',
-      observed: !!innerBounds,
-      severity: innerBounds ? 'none' : 'high',
-      metric: innerBounds ? 'Inner frame detected' : 'Inner frame not detected',
-      note: 'If the front border-to-art transition is not detectable, centering confidence is limited.',
+      observed: !innerBounds || borderConfidence.severity !== 'none',
+      severity: !innerBounds
+        ? 'high'
+        : borderConfidence.severity,
+      metric: !innerBounds
+        ? 'Inner frame not detected'
+        : `Inner frame detected; ${borderConfidence.metric}`,
+      note: !innerBounds
+        ? 'If the front border-to-art transition is not detectable, centering confidence is limited.'
+        : borderConfidence.note,
       impactsObservability: true
     }
   ];
@@ -3771,6 +3864,67 @@ export function observabilityCeilingFromQuality(quality: QualityAssessment): Gra
     return gradeCapReason('confidence', { gradeLabel: 'MINT 9', psaNumeric: 9 }, 'Minor image-quality limits remain even though the card is generally scorable.');
   }
   return gradeCapReason('confidence', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, 'Image quality is strong enough that observability does not materially lower the grade ceiling.');
+}
+
+function buildCanvasUnscorableReasons(quality: QualityAssessment, innerBounds: ContentBounds | null): UnscorableReason[] {
+  const reasons: UnscorableReason[] = [];
+  const borderVisibilityCheck = quality.checks.find((check) => check.key === 'full_front_border');
+  const severeBorderVisibility = borderVisibilityCheck?.severity === 'high';
+  if (!quality.cardDetected) {
+    reasons.push({
+      code: 'CARD_NOT_FOUND',
+      message: 'Could not reliably localize the full card front in the image.'
+    });
+  } else {
+    if (!innerBounds) {
+      reasons.push({
+        code: 'BORDER_NOT_DETECTABLE',
+        message: 'Could not reliably detect the inner border-to-art boundary needed for centering.'
+      });
+    }
+  }
+
+  // Do not force UNSCORABLE solely from conservative visibility flags if centering is still measurable.
+  if (quality.cardDetected && !quality.fullFrontVisible && (!innerBounds || severeBorderVisibility)) {
+    reasons.push({
+      code: 'CARD_PARTIAL',
+      message: borderVisibilityCheck?.metric
+        ? `Full-border confidence is too low for reliable grading (${borderVisibilityCheck.metric}).`
+        : 'The full card front is not fully visible, so a PSA-style front grade is not reliable.'
+    });
+  }
+
+  const blurCheck = quality.checks.find((check) => check.key === 'blur');
+  if (blurCheck?.severity === 'high') {
+    reasons.push({
+      code: 'BLURRY',
+      message: blurCheck.metric
+        ? `Image blur is too high for reliable grading (${blurCheck.metric}).`
+        : 'Image blur is too high for reliable grading.'
+    });
+  }
+
+  const glareCheck = quality.checks.find((check) => check.key === 'glare');
+  if (glareCheck?.severity === 'high') {
+    reasons.push({
+      code: 'GLARE',
+      message: glareCheck.metric
+        ? `Strong glare/reflection detected (${glareCheck.metric}).`
+        : 'Strong glare/reflection detected.'
+    });
+  }
+
+  const perspectiveCheck = quality.checks.find((check) => check.key === 'perspective');
+  if (perspectiveCheck?.severity === 'high') {
+    reasons.push({
+      code: 'EXTREME_SKEW',
+      message: perspectiveCheck.metric
+        ? `Perspective distortion is too high for reliable border measurement (${perspectiveCheck.metric}).`
+        : 'Perspective distortion is too high for reliable border measurement.'
+    });
+  }
+
+  return reasons;
 }
 
 function buildStructuredGradeReport(args: {
@@ -4178,7 +4332,7 @@ function computeCentering(cv: any, rectifiedRGBA: any): CenteringResult | null {
       rectifiedSize: { w, h },
       border: { leftPx, rightPx, topPx, bottomPx, leftPct, rightPct, topPct, bottomPct },
       cardRect: { x: 0, y: 0, w, h },
-      innerRect: { x: left, y: top, w: right - left, h: bottom - top }
+      innerRect: { x: left, y: top, w: right - left + 1, h: bottom - top + 1 }
     }
   };
 }
@@ -4611,7 +4765,7 @@ function drawOverlay(cv: any, rectifiedRGBA: any, centering: CenteringResult | n
   if (centering) {
     const { innerRect, border } = centering.debug;
     const rect = new cv.Rect(innerRect.x, innerRect.y, innerRect.w, innerRect.h);
-    cv.rectangle(overlay, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(125, 211, 252, 255), 2);
+    cv.rectangle(overlay, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width - 1, rect.y + rect.height - 1), new cv.Scalar(125, 211, 252, 255), 2);
 
     // Midlines
     cv.line(overlay, new cv.Point(Math.floor(overlay.cols / 2), 0), new cv.Point(Math.floor(overlay.cols / 2), overlay.rows), new cv.Scalar(255, 255, 255, 80), 1);

@@ -277,3 +277,112 @@ input[type="file"]{color:var(--muted)}
 .overlayGuideInnerBottom{color:#f97316}
 
 .notice{padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);color:var(--muted);font-size:13px}
+
+.resultModalBackdrop{
+  position:fixed;
+  inset:0;
+  z-index:1200;
+  background:rgba(3,6,12,.74);
+  display:flex;
+  align-items:flex-start;
+  justify-content:center;
+  padding:24px;
+  overflow:auto;
+}
+.resultModal{
+  width:min(1080px, 100%);
+  max-height:calc(100vh - 48px);
+  display:flex;
+  flex-direction:column;
+  border:1px solid var(--border);
+  border-radius:16px;
+  background:linear-gradient(180deg, #121724, #0e1420);
+  box-shadow:0 30px 70px rgba(0,0,0,.45);
+  overflow:hidden;
+}
+.resultModalHeader{
+  padding:14px 16px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:12px;
+}
+.resultModalTitle{
+  font-size:16px;
+  font-weight:700;
+  color:var(--text);
+}
+.resultModalBody{
+  padding:16px;
+  overflow:auto;
+  display:grid;
+  gap:16px;
+}
+.resultModalImageGrid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+  gap:12px;
+}
+.resultModalFigure{
+  margin:0;
+  display:grid;
+  gap:8px;
+}
+.resultModalFigure figcaption{
+  font-size:12px;
+  color:var(--muted);
+}
+.resultModalFigure img{
+  width:100%;
+  height:auto;
+  max-height:560px;
+  object-fit:contain;
+  border-radius:12px;
+  border:1px solid var(--border);
+  background:#0a0f19;
+}
+.resultModalSection{
+  padding:12px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:rgba(255,255,255,.02);
+  display:grid;
+  gap:8px;
+}
+.resultModalSection h3{
+  margin:0;
+  font-size:14px;
+}
+.resultModalList{
+  margin:0;
+  padding-left:18px;
+  display:grid;
+  gap:6px;
+}
+.resultModalPre{
+  margin:8px 0 0;
+  font-size:11px;
+  white-space:pre-wrap;
+  word-break:break-word;
+  padding:10px;
+  border-radius:10px;
+  border:1px solid var(--border);
+  background:rgba(0,0,0,.22);
+  max-height:280px;
+  overflow:auto;
+}
+
+@media (max-width: 720px){
+  .resultModalBackdrop{
+    padding:10px;
+    align-items:stretch;
+  }
+  .resultModal{
+    max-height:100vh;
+    border-radius:12px;
+  }
+  .resultModalBody{
+    padding:12px;
+  }
+}

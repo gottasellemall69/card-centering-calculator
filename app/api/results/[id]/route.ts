@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import * as fs from 'node:fs/promises';
 import path from 'path';
 
-const BASE = process.env.CARD_GRADER_OUTDIR || '/tmp/card-grader-results';
+const BASE = process.env.CARD_GRADER_OUTDIR || 'api/results';
 export const runtime = 'nodejs';
 
 export async function GET( _req: Request, ctx: { params: Promise<{ id: string; }>; } ) {

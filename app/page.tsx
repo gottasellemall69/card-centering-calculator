@@ -3,12 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 
-import type { GradeResult } from '@/lib/grader';
+import type { GradeResult, ManualGuideOverride } from '@/lib/grader';
 import { OverlayViewer, type ManualCenteringView } from '@/components/OverlayViewer';
 import { flattenGradeResult, serializeGradeRowsToCsv } from '@/lib/resultExport';
 import { finalGradeFromCaps } from '@/lib/rubric';
 
-type RowStatus = 'PENDING' | 'PREPARING' | 'REVIEW' | 'PROCESSING' | 'SAVING' | 'DONE' | 'ERROR';
+type RowStatus = 'PENDING' | 'PREPARING' | 'REVIEW' | 'PROCESSING' | 'DONE' | 'ERROR';
 
 type Row = {
   id: string;
@@ -16,7 +16,6 @@ type Row = {
   file: File;
   status: RowStatus;
   engine?: 'WORKER';
-  savedId?: string;
   startedAtMs?: number;
   completedAtMs?: number;
   preview?: GradeResult;
@@ -24,12 +23,22 @@ type Row = {
   manualCentering?: ManualCenteringView | null;
   error?: string;
   sourceObjectURL: string;
-  overlayPNG?: string;
-  rectifiedPNG?: string;
+  overlayObjectURL?: string;
+  rectifiedObjectURL?: string;
+};
+
+type ResultModalPayload = {
+  rowId: string;
+  filename: string;
+  result: GradeResult;
+  overlayObjectURL?: string;
+  rectifiedObjectURL?: string;
+  sourceObjectURL: string;
+  openedAtMs: number;
 };
 
 type PrepareWorkerRequest = { type: 'PREPARE'; id: string; file: File; };
-type GradeWorkerRequest = { type: 'GRADE'; id: string; file: File; };
+type GradeWorkerRequest = { type: 'GRADE'; id: string; file: File; manualGuideOverride?: ManualGuideOverride | null; };
 type WorkerRequest = PrepareWorkerRequest | GradeWorkerRequest;
 
 type WorkerPreparedMessage = {
@@ -42,23 +51,22 @@ type WorkerDoneMessage = {
   type: 'DONE';
   id: string;
   result: GradeResult;
-  overlayPNG: string;
-  rectifiedPNG: string;
+  overlayBlob: Blob;
+  rectifiedBlob: Blob;
 };
 
 type WorkerErrorMessage = { type: 'ERROR'; id: string; error: string; };
 type WorkerResponse = WorkerPreparedMessage | WorkerDoneMessage | WorkerErrorMessage;
 
 type PrepareOutput = { result: GradeResult; engine: 'WORKER'; };
-type GradeOutput = { result: GradeResult; overlayPNG: string; rectifiedPNG: string; engine: 'WORKER'; };
-type SaveResponse = { ok: boolean; id?: string; error?: string; };
+type GradeOutput = { result: GradeResult; overlayBlob: Blob; rectifiedBlob: Blob; engine: 'WORKER'; };
 
 const WORKER_TASK_TIMEOUT_MS = 20000;
-const SAVE_TIMEOUT_MS = 20000;
 
 export default function Page() {
   const [rows, setRows] = useState<Row[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [resultModal, setResultModal] = useState<ResultModalPayload | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number; mode: 'preparing' | 'grading'; } | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -67,6 +75,7 @@ export default function Page() {
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const stopRequestedRef = useRef(false);
   const workerRef = useRef<Worker | null>(null);
+  const rowsRef = useRef<Row[]>([]);
   const inFlightRef = useRef<{
     id: string;
     requestType: WorkerRequest['type'];
@@ -74,6 +83,16 @@ export default function Page() {
     reject: (reason?: unknown) => void;
     timeoutId: number;
   } | null>(null);
+
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+
+  useEffect(() => {
+    return () => {
+      rowsRef.current.forEach((row) => revokeRowObjectUrls(row));
+    };
+  }, []);
 
   const selected = useMemo(() => rows.find((row) => row.id === selectedId) ?? null, [rows, selectedId]);
   const selectedSeedResult = selected?.result ?? selected?.preview ?? null;
@@ -128,8 +147,8 @@ export default function Page() {
       if (pending.requestType === 'GRADE' && message.type === 'DONE') {
         pending.resolve({
           result: message.result,
-          overlayPNG: message.overlayPNG,
-          rectifiedPNG: message.rectifiedPNG,
+          overlayBlob: message.overlayBlob,
+          rectifiedBlob: message.rectifiedBlob,
           engine: 'WORKER'
         });
         return;
@@ -223,7 +242,7 @@ export default function Page() {
     });
   };
 
-  const gradeWithWorker = (id: string, file: File) => {
+  const gradeWithWorker = (id: string, file: File, manualGuideOverride?: ManualGuideOverride | null) => {
     return new Promise<GradeOutput>((resolve, reject) => {
       setupWorker();
       const worker = workerRef.current;
@@ -255,7 +274,7 @@ export default function Page() {
         timeoutId
       };
 
-      const message: GradeWorkerRequest = { type: 'GRADE', id, file };
+      const message: GradeWorkerRequest = { type: 'GRADE', id, file, manualGuideOverride: manualGuideOverride ?? null };
       worker.postMessage(message);
     });
   };
@@ -279,9 +298,9 @@ export default function Page() {
     }
   };
 
-  const gradeWithRecovery = async (id: string, file: File) => {
+  const gradeWithRecovery = async (id: string, file: File, manualGuideOverride?: ManualGuideOverride | null) => {
     try {
-      return await gradeWithWorker(id, file);
+      return await gradeWithWorker(id, file, manualGuideOverride);
     } catch (firstErr: any) {
       if (stopRequestedRef.current) {
         throw new Error('Cancelled by user.');
@@ -289,53 +308,13 @@ export default function Page() {
 
       restartWorker('Worker restarted after failure.');
       try {
-        return await gradeWithWorker(id, file);
+        return await gradeWithWorker(id, file, manualGuideOverride);
       } catch (secondErr: any) {
         const firstMessage = firstErr instanceof Error ? firstErr.message : String(firstErr);
         const secondMessage = secondErr instanceof Error ? secondErr.message : String(secondErr);
         throw new Error(`Worker grading failed twice: ${firstMessage} | ${secondMessage}`);
       }
     }
-  };
-
-  const saveAnalyzedResult = async (args: {
-    id: string;
-    filename: string;
-    rectifiedPNG: string;
-    overlayPNG: string;
-    result: GradeResult;
-  }): Promise<string> => {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), SAVE_TIMEOUT_MS);
-    let response: Response;
-    try {
-      response = await fetch('/api/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(args),
-        signal: controller.signal
-      });
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new Error(`Save request timed out after ${Math.round(SAVE_TIMEOUT_MS / 1000)}s.`);
-      }
-      throw error;
-    } finally {
-      window.clearTimeout(timeoutId);
-    }
-
-    let payload: SaveResponse;
-    try {
-      payload = await response.json() as SaveResponse;
-    } catch {
-      throw new Error(`Save failed (${response.status}): invalid JSON response.`);
-    }
-
-    if (!response.ok || !payload.ok || !payload.id) {
-      throw new Error(payload.error || `Save failed (${response.status}).`);
-    }
-
-    return payload.id;
   };
 
   useEffect(() => {
@@ -350,6 +329,22 @@ export default function Page() {
     const intervalId = window.setInterval(() => setNowMs(Date.now()), 250);
     return () => window.clearInterval(intervalId);
   }, [isProcessing]);
+
+  useEffect(() => {
+    if (!resultModal) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setResultModal(null);
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [resultModal]);
 
   const onFiles = async (files: FileList | File[]) => {
     const jobs = Array.from(files)
@@ -398,9 +393,8 @@ export default function Page() {
               completedAtMs: undefined,
               preview: undefined,
               result: undefined,
-              overlayPNG: undefined,
-              rectifiedPNG: undefined,
-              savedId: undefined
+              overlayObjectURL: undefined,
+              rectifiedObjectURL: undefined
             }
             : current
         )));
@@ -469,7 +463,6 @@ export default function Page() {
           ...row,
           status: 'PROCESSING',
           error: undefined,
-          savedId: undefined,
           startedAtMs: Date.now(),
           completedAtMs: undefined
         }
@@ -477,30 +470,17 @@ export default function Page() {
     )));
 
     try {
-      const { result: gradedResult, overlayPNG, rectifiedPNG, engine } = await gradeWithRecovery(selected.id, selected.file);
+      const manualGuideOverride = toManualGuideOverride(selected.manualCentering ?? null);
+      const { result: gradedResult, overlayBlob, rectifiedBlob, engine } = await gradeWithRecovery(
+        selected.id,
+        selected.file,
+        manualGuideOverride
+      );
       const finalResult = applyManualCenteringOverride(gradedResult, selected.manualCentering ?? null);
-
-      setRows((prev) => prev.map((row) => (
-        row.id === selected.id
-          ? {
-            ...row,
-            status: 'SAVING',
-            result: finalResult,
-            overlayPNG,
-            rectifiedPNG,
-            engine,
-            error: undefined
-          }
-          : row
-      )));
-
-      const savedId = await saveAnalyzedResult({
-        id: selected.id,
-        filename: selected.filename,
-        rectifiedPNG,
-        overlayPNG,
-        result: finalResult
-      });
+      const overlayObjectURL = URL.createObjectURL(overlayBlob);
+      const rectifiedObjectURL = URL.createObjectURL(rectifiedBlob);
+      revokeObjectUrlSafe(selected.overlayObjectURL);
+      revokeObjectUrlSafe(selected.rectifiedObjectURL);
 
       setRows((prev) => prev.map((row) => (
         row.id === selected.id
@@ -508,11 +488,24 @@ export default function Page() {
             ...row,
             status: 'DONE',
             result: finalResult,
-            savedId,
+            overlayObjectURL,
+            rectifiedObjectURL,
+            engine,
+            error: undefined,
             completedAtMs: Date.now()
           }
           : row
       )));
+
+      setResultModal({
+        rowId: selected.id,
+        filename: selected.filename,
+        result: finalResult,
+        overlayObjectURL,
+        rectifiedObjectURL,
+        sourceObjectURL: selected.sourceObjectURL,
+        openedAtMs: Date.now()
+      });
     } catch (error: any) {
       setRows((prev) => prev.map((row) => (
         row.id === selected.id
@@ -539,7 +532,7 @@ export default function Page() {
 
   const getElapsedLabel = (row: Row): string => {
     if (!row.startedAtMs) return '-';
-    const running = row.status === 'PREPARING' || row.status === 'PROCESSING' || row.status === 'SAVING';
+    const running = row.status === 'PREPARING' || row.status === 'PROCESSING';
     const endMs = row.completedAtMs ?? (running ? nowMs : row.startedAtMs);
     return formatDurationMs(Math.max(0, endMs - row.startedAtMs));
   };
@@ -547,15 +540,16 @@ export default function Page() {
   const clearAll = () => {
     stopRequestedRef.current = true;
     restartWorker('Processing cancelled.');
-    rows.forEach((row) => URL.revokeObjectURL(row.sourceObjectURL));
+    rows.forEach((row) => revokeRowObjectUrls(row));
     setRows([]);
     setSelectedId(null);
+    setResultModal(null);
     setBatchProgress(null);
   };
 
   const downloadJSON = () => {
     const payload = rows
-      .filter(hasSavedResult)
+      .filter(hasResult)
       .map((row) => ({ id: row.id, filename: row.filename, ...row.result }));
     const blob = new Blob([JSON.stringify({ generatedAt: new Date().toISOString(), results: payload }, null, 2)], {
       type: 'application/json'
@@ -570,7 +564,7 @@ export default function Page() {
 
   const downloadCSV = () => {
     const data = rows
-      .filter(hasSavedResult)
+      .filter(hasResult)
       .map((row) => flattenGradeResult(row.filename, row.result));
     const csv = serializeGradeRowsToCsv(data);
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -592,15 +586,18 @@ export default function Page() {
     && !!selected
     && selected.status !== 'PREPARING'
     && selected.status !== 'PROCESSING'
-    && selected.status !== 'SAVING'
     && !isProcessing;
 
   return (
+    <>
     <div className="row">
       <section className="card" style={{ flex: '1 1 420px', minWidth: 320 }}>
         <h2 style={{ marginTop: 0, fontSize: 16 }}>1) Upload images (front only)</h2>
         <div className="notice" style={{ marginBottom: 12 }}>
           Upload a card photo, review the detected measurement area, then estimate the grade once the guides look right.
+        </div>
+        <div className="small" style={{ marginBottom: 12 }}>
+          Nothing is persisted automatically. Images and overlays stay in memory for the current session unless you explicitly export results.
         </div>
 
         <div className="row" style={{ alignItems: 'center' }}>
@@ -693,7 +690,7 @@ export default function Page() {
             Filters to PNG, JPG, and WEBP. Uploading now prepares the card bounds for review instead of immediately grading the image.
           </div>
           <div className="small" style={{ marginTop: 4 }}>
-            Status flow: PENDING - PREPARING - REVIEW - PROCESSING - SAVING - DONE/ERROR.
+            Status flow: PENDING - PREPARING - REVIEW - PROCESSING - DONE/ERROR.
           </div>
         </div>
 
@@ -809,13 +806,13 @@ export default function Page() {
                 Engine: <b style={{ color: 'var(--text)' }}>{selected.engine ?? '-'}</b>
               </div>
               <div className="badge">
-                Saved: <b style={{ color: 'var(--text)' }}>{selected.savedId ?? 'No'}</b>
+                Session only: <b style={{ color: 'var(--text)' }}>Yes</b>
               </div>
             </div>
 
             {selected.error ? (
               <div className="notice" style={{ marginTop: 10 }}>
-                {selected.status === 'ERROR' ? `Error: ${selected.error}` : `Save error: ${selected.error}`}
+                {`Error: ${selected.error}`}
               </div>
             ) : null}
 
@@ -823,23 +820,42 @@ export default function Page() {
               <div className="notice" style={{ flex: '1 1 320px' }}>
                 The current guide positions are the measurement area that will be used for centering when you estimate this image.
               </div>
-              <button
-                type="button"
-                className="btn btnPrimary"
-                onClick={() => void estimateSelected()}
-                disabled={!canEstimate}
-              >
-                {selected.status === 'PROCESSING' || selected.status === 'SAVING'
-                  ? 'Estimating...'
-                  : displayedResult
-                    ? 'Re-estimate grade'
-                    : 'Estimate grade'}
-              </button>
+              <div className="row" style={{ gap: 8 }}>
+                {displayedResult ? (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setResultModal({
+                      rowId: selected.id,
+                      filename: selected.filename,
+                      result: displayedResult,
+                      overlayObjectURL: selected.overlayObjectURL,
+                      rectifiedObjectURL: selected.rectifiedObjectURL,
+                      sourceObjectURL: selected.sourceObjectURL,
+                      openedAtMs: Date.now()
+                    })}
+                  >
+                    View full evidence
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="btn btnPrimary"
+                  onClick={() => void estimateSelected()}
+                  disabled={!canEstimate}
+                >
+                  {selected.status === 'PROCESSING'
+                    ? 'Estimating...'
+                    : displayedResult
+                      ? 'Re-estimate grade'
+                      : 'Estimate grade'}
+                </button>
+              </div>
             </div>
 
             {estimateNeedsRefresh ? (
               <div className="notice" style={{ marginTop: 10 }}>
-                Guides changed after the last estimate. Click Re-estimate grade to apply the current measurement area to the saved result.
+                Guides changed after the last estimate. Click Re-estimate grade to apply the current measurement area to the current result.
               </div>
             ) : null}
 
@@ -957,7 +973,7 @@ export default function Page() {
               <>
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Estimate</h3>
                 <div className="small">
-                  The final grade, flaw summary, and saved output will appear here after you click Estimate grade.
+                  The final grade, flaw summary, and overlay will appear here after you click Estimate grade.
                 </div>
               </>
             )}
@@ -972,6 +988,13 @@ export default function Page() {
         )}
       </section>
     </div>
+    {resultModal ? (
+      <EstimateEvidenceModal
+        payload={resultModal}
+        onClose={() => setResultModal(null)}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -1028,8 +1051,209 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
   };
 }
 
-function hasSavedResult(row: Row): row is Row & { result: GradeResult } {
+function hasResult(row: Row): row is Row & { result: GradeResult } {
   return Boolean(row.result);
+}
+
+function toManualGuideOverride(manualCentering: ManualCenteringView | null | undefined): ManualGuideOverride | null {
+  if (!manualCentering) return null;
+  const sourceSize = manualCentering.debug?.rectifiedSize;
+  const cardRect = manualCentering.debug?.cardRect;
+  const innerRect = manualCentering.debug?.innerRect;
+  if (!sourceSize || !cardRect || !innerRect) return null;
+  if (sourceSize.w <= 2 || sourceSize.h <= 2) return null;
+  if (cardRect.w <= 1 || cardRect.h <= 1 || innerRect.w <= 1 || innerRect.h <= 1) return null;
+
+  return {
+    sourceSize: { w: sourceSize.w, h: sourceSize.h },
+    cardRect: { x: cardRect.x, y: cardRect.y, w: cardRect.w, h: cardRect.h },
+    innerRect: { x: innerRect.x, y: innerRect.y, w: innerRect.w, h: innerRect.h }
+  };
+}
+
+function revokeObjectUrlSafe(url?: string): void {
+  if (!url) return;
+  URL.revokeObjectURL(url);
+}
+
+function revokeRowObjectUrls(row: Row): void {
+  revokeObjectUrlSafe(row.overlayObjectURL);
+  revokeObjectUrlSafe(row.rectifiedObjectURL);
+  revokeObjectUrlSafe(row.sourceObjectURL);
+}
+
+function EstimateEvidenceModal({
+  payload,
+  onClose
+}: {
+  payload: ResultModalPayload;
+  onClose: () => void;
+}) {
+  const result = payload.result;
+  const centering = result.centering ?? null;
+  const mm = deriveCenteringMillimeters(centering);
+  const report = result.report;
+  const flaws = result.flaws;
+  const [isRawReportOpen, setIsRawReportOpen] = useState(false);
+  const [isRawDebugOpen, setIsRawDebugOpen] = useState(false);
+  const overlaySrc = payload.overlayObjectURL ?? payload.rectifiedObjectURL ?? payload.sourceObjectURL;
+  const reportJson = useMemo(
+    () => (isRawReportOpen ? JSON.stringify(report ?? null, null, 2) : ''),
+    [isRawReportOpen, report]
+  );
+  const debugJson = useMemo(
+    () => (isRawDebugOpen ? JSON.stringify(result.debug ?? null, null, 2) : ''),
+    [isRawDebugOpen, result.debug]
+  );
+  const methodology = [
+    'Outer card bounds are detected from color/profile evidence and normalized to a standard card aspect.',
+    'Inner frame boundaries are detected from border-to-design transitions to compute centering.',
+    'Visible condition findings are measured from border, edge, corner, and interior anomaly signals on the detected card region.',
+    'Final estimate uses conservative grade ceilings from centering, visible defects, and image observability.'
+  ];
+
+  return (
+    <div className="resultModalBackdrop" onClick={onClose}>
+      <section
+        className="resultModal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Grade estimation evidence"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="resultModalHeader">
+          <div>
+            <div className="resultModalTitle">Estimation Completed</div>
+            <div className="small">{payload.filename}</div>
+            <div className="small">Generated {new Date(payload.openedAtMs).toLocaleString()}</div>
+          </div>
+          <button type="button" className="btn" onClick={onClose}>Close</button>
+        </header>
+
+        <div className="resultModalBody">
+          <div className="resultModalImageGrid">
+            <figure className="resultModalFigure">
+              <figcaption>Detection + centering evidence overlay</figcaption>
+              <img src={overlaySrc} alt={`${payload.filename} evidence overlay`} loading="lazy" decoding="async" />
+            </figure>
+            {payload.rectifiedObjectURL ? (
+              <figure className="resultModalFigure">
+                <figcaption>Rectified analysis image (exact image used for calculations)</figcaption>
+                <img src={payload.rectifiedObjectURL} alt={`${payload.filename} rectified analysis`} loading="lazy" decoding="async" />
+              </figure>
+            ) : null}
+          </div>
+
+          <section className="resultModalSection">
+            <h3>Final Result</h3>
+            <div className="kv"><div className="small">Final grade</div><div>{result.final.gradeLabel} (PSA {result.final.psaNumeric})</div></div>
+            <div className="kv"><div className="small">Confidence</div><div>{result.final.confidence.toFixed(2)}</div></div>
+            <div className="kv"><div className="small">Confidence band</div><div>{report?.confidenceBand ?? '-'}</div></div>
+            <div className="kv"><div className="small">Manual review required</div><div>{report?.manualReviewRequired ? 'YES' : 'NO'}</div></div>
+            <div className="kv"><div className="small">Unscorable</div><div>{result.final.unscorable ? 'YES' : 'NO'}</div></div>
+            {result.final.unscorableReasons?.length ? (
+              <div className="small">Reasons: {result.final.unscorableReasons.map((reason) => `${reason.code}: ${reason.message}`).join(' | ')}</div>
+            ) : null}
+          </section>
+
+          <section className="resultModalSection">
+            <h3>Centering Evidence + Calculations</h3>
+            <div className="kv"><div className="small">Left / Right ratio</div><div>{centering?.lr?.ratio ?? '-'}</div></div>
+            <div className="kv"><div className="small">Top / Bottom ratio</div><div>{centering?.tb?.ratio ?? '-'}</div></div>
+            <div className="kv"><div className="small">Worst axis used</div><div>{centering?.worst?.axis ?? '-'} {centering?.worst?.ratio ?? ''}</div></div>
+            <div className="kv"><div className="small">Centering cap</div><div>{centering?.gradeCap?.gradeLabel ?? '-'}</div></div>
+            <div className="kv"><div className="small">Border px (L/R)</div><div>{centering ? `${centering.debug.border.leftPx} / ${centering.debug.border.rightPx}` : '-'}</div></div>
+            <div className="kv"><div className="small">Border px (T/B)</div><div>{centering ? `${centering.debug.border.topPx} / ${centering.debug.border.bottomPx}` : '-'}</div></div>
+            <div className="kv"><div className="small">Border % (L/R)</div><div>{centering ? `${centering.debug.border.leftPct.toFixed(1)}% / ${centering.debug.border.rightPct.toFixed(1)}%` : '-'}</div></div>
+            <div className="kv"><div className="small">Border % (T/B)</div><div>{centering ? `${centering.debug.border.topPct.toFixed(1)}% / ${centering.debug.border.bottomPct.toFixed(1)}%` : '-'}</div></div>
+            <div className="kv"><div className="small">Estimated mm (L/R)</div><div>{mm ? `${mm.left.toFixed(2)}mm / ${mm.right.toFixed(2)}mm` : '-'}</div></div>
+            <div className="kv"><div className="small">Estimated mm (T/B)</div><div>{mm ? `${mm.top.toFixed(2)}mm / ${mm.bottom.toFixed(2)}mm` : '-'}</div></div>
+            <div className="kv"><div className="small">Card rect (x,y,w,h)</div><div>{centering ? `${centering.debug.cardRect.x}, ${centering.debug.cardRect.y}, ${centering.debug.cardRect.w}, ${centering.debug.cardRect.h}` : '-'}</div></div>
+            <div className="kv"><div className="small">Inner rect (x,y,w,h)</div><div>{centering ? `${centering.debug.innerRect.x}, ${centering.debug.innerRect.y}, ${centering.debug.innerRect.w}, ${centering.debug.innerRect.h}` : '-'}</div></div>
+          </section>
+
+          <section className="resultModalSection">
+            <h3>Detection Findings</h3>
+            {report?.detectedDefects?.length ? (
+              <ul className="resultModalList">
+                {report.detectedDefects.map((item) => (
+                  <li key={item.id}>
+                    <b>{item.flawType}</b> ({item.severity}) at {item.location}; evidence {item.evidenceStrength}
+                    {item.measurement ? `, ${item.measurement.display}` : ''}
+                    {item.region ? `, region x=${item.region.x}, y=${item.region.y}, w=${item.region.w}, h=${item.region.h}` : ''}
+                    {` - ${item.metric}`}
+                  </li>
+                ))}
+              </ul>
+            ) : flaws?.items?.length ? (
+              <ul className="resultModalList">
+                {flaws.items.map((item, index) => (
+                  <li key={index}>
+                    <b>{item.category}</b>: {item.severity} ({item.points} pts) - {item.metric}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="small">No flaws detected above thresholds.</div>
+            )}
+            {flaws?.limitingFlaws?.length ? (
+              <div className="notice">
+                Matrix floor applied from {flaws.limitingFlaws.map((item) => `${item.category} ${item.severity}`).join(', ')}.
+              </div>
+            ) : null}
+          </section>
+
+          <section className="resultModalSection">
+            <h3>Image Quality + Observability</h3>
+            <div className="kv"><div className="small">Card detected</div><div>{report?.cardDetected ? 'YES' : 'NO'}</div></div>
+            <div className="kv"><div className="small">Full front visible</div><div>{report?.fullFrontVisible ? 'YES' : 'NO'}</div></div>
+            <div className="kv"><div className="small">Quality score</div><div>{report ? report.imageQuality.imageQualityScore.toFixed(3) : '-'}</div></div>
+            <div className="kv"><div className="small">Centering ceiling</div><div>{report?.centeringGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+            <div className="kv"><div className="small">Visible-defect ceiling</div><div>{report?.visibleDefectGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+            <div className="kv"><div className="small">Confidence ceiling</div><div>{report?.confidenceGradeCeiling.cap.gradeLabel ?? '-'}</div></div>
+            <div className="small">Centering reason: {report?.centeringGradeCeiling.reason ?? '-'}</div>
+            <div className="small">Visible-defect reason: {report?.visibleDefectGradeCeiling.reason ?? '-'}</div>
+            <div className="small">Confidence reason: {report?.confidenceGradeCeiling.reason ?? '-'}</div>
+            <div className="small" style={{ marginTop: 8 }}>
+              {report?.imageQuality.checks?.length ? (
+                report.imageQuality.checks.map((check) => `${check.label}: ${check.severity.toUpperCase()}${check.metric ? ` (${check.metric})` : ''} - ${check.note}`).join(' | ')
+              ) : 'No image quality checks available.'}
+            </div>
+          </section>
+
+          <section className="resultModalSection">
+            <h3>Methodology + Notes</h3>
+            <ul className="resultModalList">
+              {methodology.map((line, index) => <li key={index}>{line}</li>)}
+            </ul>
+            <div className="small">Top reasons: {report?.topReasons?.length ? report.topReasons.join(' | ') : '-'}</div>
+            <div className="small">Top change drivers: {report?.topChangeDrivers?.length ? report.topChangeDrivers.join(' | ') : '-'}</div>
+            <div className="small">Assumptions: {report?.assumptions?.length ? report.assumptions.join(' | ') : '-'}</div>
+            <div className="small">Limitations: {report?.limitations?.length ? report.limitations.join(' | ') : '-'}</div>
+          </section>
+
+          <section className="resultModalSection">
+            <details onToggle={(event) => setIsRawReportOpen(event.currentTarget.open)}>
+              <summary>Raw report JSON</summary>
+              {isRawReportOpen ? (
+                <pre className="resultModalPre">{reportJson}</pre>
+              ) : (
+                <div className="small">Expand to render raw JSON.</div>
+              )}
+            </details>
+            <details onToggle={(event) => setIsRawDebugOpen(event.currentTarget.open)}>
+              <summary>Raw debug JSON</summary>
+              {isRawDebugOpen ? (
+                <pre className="resultModalPre">{debugJson}</pre>
+              ) : (
+                <div className="small">Expand to render raw JSON.</div>
+              )}
+            </details>
+          </section>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function sameCentering(
