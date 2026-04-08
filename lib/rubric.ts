@@ -121,33 +121,64 @@ const CONDITION_RANK: Record<TcgCondition, number> = {
   Damaged: 4
 };
 
-const TCGPLAYER_POINT_BANDS: Array<{
+// PSA-normalized flaw point bands used for the condition floor.
+// These bands are intentionally wider than the cap table so the final cap can
+// still distinguish adjacent PSA outcomes within the same broad condition.
+const PSA_FLAW_POINT_BANDS: Array<{
   condition: TcgCondition;
   minPoints: number;
   maxPoints: number | null;
 }> = [
-    { condition: 'Near Mint', minPoints: 0, maxPoints: 7 },
-    { condition: 'Lightly Played', minPoints: 8, maxPoints: 14 },
-    { condition: 'Moderately Played', minPoints: 15, maxPoints: 21 },
-    { condition: 'Heavily Played', minPoints: 22, maxPoints: 28 },
-    { condition: 'Damaged', minPoints: 29, maxPoints: null }
+    { condition: 'Near Mint', minPoints: 0, maxPoints: 2 },
+    { condition: 'Lightly Played', minPoints: 3, maxPoints: 8 },
+    { condition: 'Moderately Played', minPoints: 9, maxPoints: 17 },
+    { condition: 'Heavily Played', minPoints: 18, maxPoints: 31 },
+    { condition: 'Damaged', minPoints: 32, maxPoints: null }
   ];
 
 const PSA_FLAW_PROFILE_CAPS: Array<{ maxPoints: number; condition: string; gradeCap: GradeCap; }> = [
-  { maxPoints: 0, condition: 'PSA 10 profile', gradeCap: { gradeLabel: 'GEM-MT 10', psaNumeric: 10 } },
-  { maxPoints: 1, condition: 'PSA 9 profile', gradeCap: { gradeLabel: 'MINT 9', psaNumeric: 9 } },
-  { maxPoints: 2, condition: 'PSA 8 profile', gradeCap: { gradeLabel: 'NM-MT 8', psaNumeric: 8 } },
-  { maxPoints: 3, condition: 'PSA 7 profile', gradeCap: { gradeLabel: 'NM 7', psaNumeric: 7 } },
-  { maxPoints: 5, condition: 'PSA 6 profile', gradeCap: { gradeLabel: 'EX-MT 6', psaNumeric: 6 } },
-  { maxPoints: 7, condition: 'PSA 5 profile', gradeCap: { gradeLabel: 'EX 5', psaNumeric: 5 } },
-  { maxPoints: 10, condition: 'PSA 4 profile', gradeCap: { gradeLabel: 'VG-EX 4', psaNumeric: 4 } },
-  { maxPoints: 14, condition: 'PSA 3 profile', gradeCap: { gradeLabel: 'VG 3', psaNumeric: 3 } },
-  { maxPoints: 19, condition: 'PSA 2 profile', gradeCap: { gradeLabel: 'GOOD 2', psaNumeric: 2 } },
-  { maxPoints: 27, condition: 'PSA 1.5 profile', gradeCap: { gradeLabel: 'FR 1.5', psaNumeric: 1.5 } },
+  { maxPoints: 2, condition: 'PSA 10 profile', gradeCap: { gradeLabel: 'GEM-MT 10', psaNumeric: 10 } },
+  { maxPoints: 4, condition: 'PSA 9 profile', gradeCap: { gradeLabel: 'MINT 9', psaNumeric: 9 } },
+  { maxPoints: 8, condition: 'PSA 8 profile', gradeCap: { gradeLabel: 'NM-MT 8', psaNumeric: 8 } },
+  { maxPoints: 12, condition: 'PSA 7 profile', gradeCap: { gradeLabel: 'NM 7', psaNumeric: 7 } },
+  { maxPoints: 17, condition: 'PSA 6 profile', gradeCap: { gradeLabel: 'EX-MT 6', psaNumeric: 6 } },
+  { maxPoints: 23, condition: 'PSA 5 profile', gradeCap: { gradeLabel: 'EX 5', psaNumeric: 5 } },
+  { maxPoints: 31, condition: 'PSA 4 profile', gradeCap: { gradeLabel: 'VG-EX 4', psaNumeric: 4 } },
+  { maxPoints: 40, condition: 'PSA 3 profile', gradeCap: { gradeLabel: 'VG 3', psaNumeric: 3 } },
+  { maxPoints: 49, condition: 'PSA 2 profile', gradeCap: { gradeLabel: 'GOOD 2', psaNumeric: 2 } },
+  { maxPoints: 58, condition: 'PSA 1.5 profile', gradeCap: { gradeLabel: 'FR 1.5', psaNumeric: 1.5 } },
   { maxPoints: Number.POSITIVE_INFINITY, condition: 'PSA 1 profile', gradeCap: { gradeLabel: 'PR 1', psaNumeric: 1 } }
 ];
 
-export const TCGPLAYER_CONDITION_MATRIX: Record<
+function validateRubricInvariants(): void {
+  for ( let index = 0; index < PSA_FLAW_POINT_BANDS.length; index++ ) {
+    const band = PSA_FLAW_POINT_BANDS[ index ];
+    if ( index === 0 && band.minPoints !== 0 ) {
+      throw new Error( 'PSA_FLAW_POINT_BANDS must start at minPoints=0.' );
+    }
+    if ( index > 0 ) {
+      const previous = PSA_FLAW_POINT_BANDS[ index - 1 ];
+      if ( previous.maxPoints == null ) {
+        throw new Error( 'PSA_FLAW_POINT_BANDS cannot have entries after an open-ended band.' );
+      }
+      if ( band.minPoints !== previous.maxPoints + 1 ) {
+        throw new Error( 'PSA_FLAW_POINT_BANDS must be contiguous without gaps or overlaps.' );
+      }
+    }
+  }
+
+  let previousMax = Number.NEGATIVE_INFINITY;
+  for ( const cap of PSA_FLAW_PROFILE_CAPS ) {
+    if ( cap.maxPoints <= previousMax ) {
+      throw new Error( 'PSA_FLAW_PROFILE_CAPS must be strictly increasing by maxPoints.' );
+    }
+    previousMax = cap.maxPoints;
+  }
+}
+
+validateRubricInvariants();
+
+export const PSA_FLAW_CONDITION_MATRIX: Record<
   Exclude<TcgCondition, 'Damaged'>,
   Record<WorkbookFlawCategory, Severity>
 > = {
@@ -205,7 +236,10 @@ export const TCGPLAYER_CONDITION_MATRIX: Record<
   }
 };
 
-export const TCGPLAYER_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
+// Backward-compatible alias retained for external consumers.
+export const TCGPLAYER_CONDITION_MATRIX = PSA_FLAW_CONDITION_MATRIX;
+
+export const PSA_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
   measuredBy: string;
   thresholds: Partial<Record<Exclude<Severity, 'NONE'>, string>>;
   notes?: string[];
@@ -309,18 +343,21 @@ export const TCGPLAYER_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
   }
 };
 
+// Backward-compatible alias retained for external consumers.
+export const TCGPLAYER_MEASUREMENT_GUIDE = PSA_MEASUREMENT_GUIDE;
+
 function rubricCategoryForMatrix( category: FlawCategory ): WorkbookFlawCategory {
   if ( category === 'Corner Rounding' ) return 'Edgewear';
   return category;
 }
 
 function pointBandFromTotal( total: number ): { condition: TcgCondition; minPoints: number; maxPoints: number | null; } {
-  for ( const band of TCGPLAYER_POINT_BANDS ) {
+  for ( const band of PSA_FLAW_POINT_BANDS ) {
     if ( band.maxPoints === null || total <= band.maxPoints ) {
       return band;
     }
   }
-  return TCGPLAYER_POINT_BANDS[ TCGPLAYER_POINT_BANDS.length - 1 ];
+  return PSA_FLAW_POINT_BANDS[ PSA_FLAW_POINT_BANDS.length - 1 ];
 }
 
 function worseCondition( a: TcgCondition, b: TcgCondition ): TcgCondition {
@@ -345,11 +382,11 @@ export function severityToPoints( sev: Severity ): number {
     case 'Slight':
       return 1;
     case 'Minor':
-      return 2;
-    case 'Moderate':
       return 4;
+    case 'Moderate':
+      return 9;
     case 'Major':
-      return 8;
+      return 16;
     default:
       return 0;
   }
@@ -361,7 +398,7 @@ export function bestConditionAllowedForFlaw(
 ): TcgCondition {
   const rubricCategory = rubricCategoryForMatrix( category );
   for ( const condition of [ 'Near Mint', 'Lightly Played', 'Moderately Played', 'Heavily Played' ] as const ) {
-    if ( severityFitsWithin( severity, TCGPLAYER_CONDITION_MATRIX[ condition ][ rubricCategory ] ) ) {
+    if ( severityFitsWithin( severity, PSA_FLAW_CONDITION_MATRIX[ condition ][ rubricCategory ] ) ) {
       return condition;
     }
   }
@@ -383,7 +420,8 @@ export function assessConditionFromFlaws( items: readonly RubricFlawInput[] ): C
   } );
 
   const condition = worseCondition( pointBand.condition, matrixCondition );
-  const requiredPoints = TCGPLAYER_POINT_BANDS.find( ( band ) => band.condition === condition )?.minPoints ?? 25;
+  const requiredPoints = PSA_FLAW_POINT_BANDS.find( ( band ) => band.condition === condition )?.minPoints
+    ?? PSA_FLAW_POINT_BANDS[ PSA_FLAW_POINT_BANDS.length - 1 ].minPoints;
   const adjustedPoints = Math.max( totalPoints, requiredPoints );
   const psaProfile = psaProfileFromPoints( adjustedPoints );
 

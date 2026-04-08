@@ -1,4 +1,4 @@
-import { gradeCardFrontCanvasOnly, prepareCardFrontCanvasOnly, type GradeResult, type ManualGuideOverride } from '@/lib/grader';
+import { gradeCardFront, prepareCardFrontCanvasOnly, type GradeResult, type ManualGuideOverride } from '@/lib/grader';
 
 type PrepareRequestMessage = { type: 'PREPARE'; id: string; file: File; };
 type GradeRequestMessage = { type: 'GRADE'; id: string; file: File; manualGuideOverride?: ManualGuideOverride | null; };
@@ -36,7 +36,7 @@ ctx.onmessage = async (event: MessageEvent<GradeRequestMessageAny>) => {
       return;
     }
 
-    const { result, overlayPNG, rectifiedPNG } = await gradeCardFrontCanvasOnly(
+    const { result, overlayPNG, rectifiedPNG } = await gradeCardFront(
       message.file,
       message.manualGuideOverride ?? null
     );

@@ -326,8 +326,17 @@ export async function gradeCardFront(
   file: File,
   manualGuideOverride?: ManualGuideOverride | null
 ): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
-  const graded = await analyzeCardFrontCanvasFallback(file, 'Defaulted to canvas grading pipeline', 'grade', manualGuideOverride ?? null);
-  return ensureCanvasGradeArtifacts(graded);
+  // Manual guide override is only supported by the canvas pipeline.
+  if (manualGuideOverride) {
+    return gradeCardFrontCanvasOnly(file, manualGuideOverride);
+  }
+
+  try {
+    return await gradeCardFrontOpenCV(file);
+  } catch (cause) {
+    const graded = await analyzeCardFrontCanvasFallback(file, cause, 'grade', null);
+    return ensureCanvasGradeArtifacts(graded);
+  }
 }
 
 export async function prepareCardFrontCanvasOnly(file: File): Promise<{ result: GradeResult }> {
@@ -462,7 +471,8 @@ async function analyzeCardFrontCanvasFallback(
   const borderColor = estimateBorderColor(sourcePx, width, height);
   const colorBounds = estimateContentBounds(sourcePx, width, height, borderColor);
   const profileBounds = detectOuterCardBounds(sourcePx, width, height);
-  const autoCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height);
+  const thresholdBounds = detectOuterCardBoundsByAdaptiveThreshold(sourcePx, width, height, borderColor);
+  const autoCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height, thresholdBounds);
   const cardBounds = manualGuideBounds?.cardBounds ?? autoCardBounds;
   const sourceCardBounds = cardBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
   const paddedSourceCardBounds = manualGuideBounds
@@ -543,11 +553,18 @@ async function analyzeCardFrontCanvasFallback(
   const normalizedBorderColor = estimateBorderColor(normalizedPx, normalizedWidth, normalizedHeight);
   const normalizedColorBounds = estimateContentBounds(normalizedPx, normalizedWidth, normalizedHeight, normalizedBorderColor);
   const normalizedProfileBounds = detectOuterCardBounds(normalizedPx, normalizedWidth, normalizedHeight);
+  const normalizedThresholdBounds = detectOuterCardBoundsByAdaptiveThreshold(
+    normalizedPx,
+    normalizedWidth,
+    normalizedHeight,
+    normalizedBorderColor
+  );
   const normalizedDetectedCardBounds = chooseBestCardBounds(
     normalizedColorBounds,
     normalizedProfileBounds,
     normalizedWidth,
-    normalizedHeight
+    normalizedHeight,
+    normalizedThresholdBounds
   );
   const normalizedBorderConfidence = manualGuideBounds
     ? manualGuideBorderConfidence(normalizedMappedCardBounds, normalizedWidth, normalizedHeight)
@@ -603,8 +620,10 @@ async function analyzeCardFrontCanvasFallback(
     normalizedSize: { w: normalizedWidth, h: normalizedHeight },
     colorBounds,
     profileBounds,
+    thresholdBounds,
     normalizedColorBounds,
     normalizedProfileBounds,
+    normalizedThresholdBounds,
     autoCardBounds,
     manualGuideOverride,
     manualGuideBounds,
@@ -1536,17 +1555,105 @@ function detectOuterCardBounds(
   return { minX: left, minY: top, maxX: right, maxY: bottom };
 }
 
+function detectOuterCardBoundsByAdaptiveThreshold(
+  px: Uint8ClampedArray,
+  width: number,
+  height: number,
+  border: { r: number; g: number; b: number }
+): ContentBounds | null {
+  if (width < 64 || height < 64) return null;
+
+  const sampleStep = Math.max(1, Math.floor(Math.min(width, height) / 900));
+  const histogram = new Array<number>(256).fill(0);
+  let samples = 0;
+  for (let y = 0; y < height; y += sampleStep) {
+    for (let x = 0; x < width; x += sampleStep) {
+      const index = (y * width + x) * 4;
+      const luma = Math.round((px[index] * 0.299) + (px[index + 1] * 0.587) + (px[index + 2] * 0.114));
+      histogram[Math.max(0, Math.min(255, luma))]++;
+      samples++;
+    }
+  }
+  if (samples < 64) return null;
+
+  const otsuThreshold = otsuFromHistogram(histogram, samples);
+  const borderLuma = (border.r * 0.299) + (border.g * 0.587) + (border.b * 0.114);
+  const adaptiveDelta = Math.max(14, Math.min(72, Math.abs(otsuThreshold - borderLuma) * 0.72 + 10));
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += sampleStep) {
+    for (let x = 0; x < width; x += sampleStep) {
+      const index = (y * width + x) * 4;
+      const luma = (px[index] * 0.299) + (px[index + 1] * 0.587) + (px[index + 2] * 0.114);
+      if (Math.abs(luma - borderLuma) >= adaptiveDelta) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+  const expanded = {
+    minX: clampInt(minX - sampleStep, 0, width - 1),
+    minY: clampInt(minY - sampleStep, 0, height - 1),
+    maxX: clampInt(maxX + sampleStep, 0, width - 1),
+    maxY: clampInt(maxY + sampleStep, 0, height - 1)
+  };
+  const candidateWidth = Math.max(1, expanded.maxX - expanded.minX + 1);
+  const candidateHeight = Math.max(1, expanded.maxY - expanded.minY + 1);
+  const areaFrac = (candidateWidth * candidateHeight) / Math.max(1, width * height);
+  if (areaFrac < 0.22 || areaFrac > 0.99) return null;
+  return expanded;
+}
+
+function otsuFromHistogram(histogram: number[], sampleCount: number): number {
+  let totalSum = 0;
+  for (let level = 0; level < histogram.length; level++) {
+    totalSum += level * histogram[level];
+  }
+
+  let backgroundCount = 0;
+  let backgroundSum = 0;
+  let maxVariance = -1;
+  let threshold = 127;
+
+  for (let level = 0; level < histogram.length; level++) {
+    backgroundCount += histogram[level];
+    if (backgroundCount === 0) continue;
+
+    const foregroundCount = sampleCount - backgroundCount;
+    if (foregroundCount === 0) break;
+
+    backgroundSum += level * histogram[level];
+    const backgroundMean = backgroundSum / backgroundCount;
+    const foregroundMean = (totalSum - backgroundSum) / foregroundCount;
+    const meanDelta = backgroundMean - foregroundMean;
+    const variance = backgroundCount * foregroundCount * meanDelta * meanDelta;
+    if (variance > maxVariance) {
+      maxVariance = variance;
+      threshold = level;
+    }
+  }
+  return threshold;
+}
+
 export function chooseBestCardBounds(
   colorBounds: ContentBounds | null,
   profileBounds: ContentBounds | null,
   width: number,
-  height: number
+  height: number,
+  thresholdBounds?: ContentBounds | null
 ): ContentBounds | null {
-  const candidates = [colorBounds, profileBounds].filter((x): x is ContentBounds => !!x);
-  if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0];
-
-  if (colorBounds && profileBounds) {
+  let baseChoice: ContentBounds | null = null;
+  const pairCandidates = [colorBounds, profileBounds].filter((x): x is ContentBounds => !!x);
+  if (pairCandidates.length === 1) {
+    baseChoice = pairCandidates[0];
+  } else if (pairCandidates.length >= 2 && colorBounds && profileBounds) {
     const containmentTolerance = Math.max(4, Math.round(Math.min(width, height) * 0.01));
     const colorContainsProfile = boundsContain(colorBounds, profileBounds, containmentTolerance);
     const profileContainsColor = boundsContain(profileBounds, colorBounds, containmentTolerance);
@@ -1556,25 +1663,46 @@ export function chooseBestCardBounds(
     // When the profile detector finds a strong interior print window inside a plausible
     // full-card box, prefer the outer color-based candidate to avoid zooming into the art.
     if (colorContainsProfile && isFinite(colorScore)) {
-      return colorBounds;
-    }
-    if (profileContainsColor && isFinite(profileScore)) {
-      return profileBounds;
-    }
-
-    const merged = mergeBounds(colorBounds, profileBounds, width, height);
-    const mergedScore = scoreCardBounds(merged, width, height);
-    if (overlapFraction(colorBounds, profileBounds) >= 0.72 && isFinite(mergedScore) && mergedScore >= Math.max(colorScore, profileScore) - 0.1) {
-      return merged;
+      baseChoice = colorBounds;
+    } else if (profileContainsColor && isFinite(profileScore)) {
+      baseChoice = profileBounds;
+    } else {
+      const merged = mergeBounds(colorBounds, profileBounds, width, height);
+      const mergedScore = scoreCardBounds(merged, width, height);
+      if (overlapFraction(colorBounds, profileBounds) >= 0.72 && isFinite(mergedScore) && mergedScore >= Math.max(colorScore, profileScore) - 0.1) {
+        baseChoice = merged;
+      } else if (!isFinite(colorScore) && !isFinite(profileScore)) {
+        baseChoice = colorBounds ?? profileBounds;
+      } else {
+        baseChoice = colorScore >= profileScore ? colorBounds : profileBounds;
+      }
     }
   }
 
-  const a = candidates[0];
-  const b = candidates[1];
-  const sa = scoreCardBounds(a, width, height);
-  const sb = scoreCardBounds(b, width, height);
-  if (!isFinite(sa) && !isFinite(sb)) return colorBounds ?? profileBounds;
-  return sa >= sb ? a : b;
+  if (!thresholdBounds) return baseChoice;
+  if (!baseChoice) return thresholdBounds;
+
+  const tolerance = Math.max(4, Math.round(Math.min(width, height) * 0.01));
+  const baseContainsThreshold = boundsContain(baseChoice, thresholdBounds, tolerance);
+  const thresholdContainsBase = boundsContain(thresholdBounds, baseChoice, tolerance);
+  const baseScore = scoreCardBounds(baseChoice, width, height);
+  const thresholdScore = scoreCardBounds(thresholdBounds, width, height);
+
+  if (baseContainsThreshold && isFinite(baseScore)) return baseChoice;
+  if (thresholdContainsBase && isFinite(thresholdScore)) return thresholdBounds;
+
+  const merged = mergeBounds(baseChoice, thresholdBounds, width, height);
+  const mergedScore = scoreCardBounds(merged, width, height);
+  if (
+    overlapFraction(baseChoice, thresholdBounds) >= 0.68
+    && isFinite(mergedScore)
+    && mergedScore >= Math.max(baseScore, thresholdScore) - 0.08
+  ) {
+    return merged;
+  }
+  if (!isFinite(baseScore)) return thresholdBounds;
+  if (!isFinite(thresholdScore)) return baseChoice;
+  return thresholdScore > baseScore ? thresholdBounds : baseChoice;
 }
 
 function scoreCardBounds(bounds: ContentBounds, width: number, height: number): number {
@@ -2537,10 +2665,6 @@ function pxAreaToCm2(pxArea: number, cardWidthPx: number, cardHeightPx: number):
   return pxArea * cmPerPxX * cmPerPxY;
 }
 
-function pxAreaToMm2(pxArea: number, cardWidthPx: number, cardHeightPx: number): number {
-  return pxAreaToCm2(pxArea, cardWidthPx, cardHeightPx) * 100;
-}
-
 function toFindingRegion(bounds: ContentBounds, width: number, height: number): FindingRegion {
   return {
     x: bounds.minX,
@@ -2562,10 +2686,6 @@ function formatLengthCm(value: number): string {
 
 function formatAreaCm2(value: number): string {
   return `${value.toFixed(2)}cm²`;
-}
-
-function formatAreaMm2(value: number): string {
-  return `${value.toFixed(2)}mm²`;
 }
 
 function confidenceBandFromScore(confidence: number): 'low' | 'medium' | 'high' {
@@ -2915,15 +3035,24 @@ export function detectCanvasPsaStyleFlaws(
       : scratchScore > 4.5 ? 'Minor'
         : scratchScore > 1.8 ? 'Slight'
           : 'NONE';
-  const scratchMeasuredSeverity = severityFromThresholds(scratchLengthCm, {
+  let scratchMeasuredSeverity = severityFromThresholds(scratchLengthCm, {
     slight: TUNING.scratchMinLenCmSlight,
     minor: TUNING.scratchMinLenCmMinor,
     moderate: TUNING.scratchMinLenCmModerate
   });
   const scratchEvidenceStrength: EvidenceStrength =
-    scratchHotspots.some((hotspot) => hotspot.linearCount >= 3) || scratchHotspots.length >= 2 || scratchLengthCm >= TUNING.scratchMinLenCmMinor
+    scratchHotspots.some((hotspot) => hotspot.linearCount >= 3) || scratchHotspots.length >= 2
       ? 'high'
       : scratchHotspots.length >= 1 ? 'medium' : 'low';
+  // Guardrail: measured line-length alone can overfire on print textures/artwork edges.
+  // If the score model sees no meaningful scratch signal, require strong corroboration.
+  if (scratchMeasuredSeverity !== 'NONE' && scratchScoreSeverity === 'NONE') {
+    if (scratchEvidenceStrength === 'high') {
+      scratchMeasuredSeverity = downgradeSeverityBySteps(scratchMeasuredSeverity, 2);
+    } else {
+      scratchMeasuredSeverity = 'NONE';
+    }
+  }
   let scratchSeverity = combineDetectedSeverity(
     scratchScoreSeverity,
     scratchMeasuredSeverity,
@@ -3160,12 +3289,12 @@ export function detectCanvasPsaStyleFlaws(
       : cornerWearScore > 26 ? 'Minor'
         : cornerWearScore > 15 ? 'Slight'
           : 'NONE';
-  const cornerMeasuredSeverity = severityFromThresholds(cornerHotspots.length, {
-    slight: 1,
-    minor: 2,
-    moderate: 3,
-    major: 4
-  });
+  // Affected-corner count is used to stabilize low-confidence corner detections,
+  // not to force severe grades by itself on naturally rounded/factory corners.
+  const cornerMeasuredSeverity: Severity =
+    cornerHotspots.length >= 3 ? 'Minor'
+      : cornerHotspots.length >= 1 ? 'Slight'
+        : 'NONE';
   const cornerEvidenceStrength: EvidenceStrength =
     cornerHotspots.length >= 2 || cornerHotspots.some((hotspot) => hotspot.score >= 34)
       ? 'high'
@@ -4371,9 +4500,13 @@ export function buildCanvasQualityAssessment(args: {
 }
 
 export function observabilityCeilingFromQuality(quality: QualityAssessment): GradeCeilingAssessment {
-  const highCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'high').length;
-  const moderateCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'moderate').length;
-  const lowCount = quality.checks.filter((check) => check.impactsObservability && check.severity === 'low').length;
+  const observabilityChecks = quality.checks.filter((check) => check.impactsObservability);
+  const highChecks = observabilityChecks.filter((check) => check.severity === 'high');
+  const moderateCount = observabilityChecks.filter((check) => check.severity === 'moderate').length;
+  const lowCount = observabilityChecks.filter((check) => check.severity === 'low').length;
+  const highCount = highChecks.length;
+  const highNonResolutionCount = highChecks.filter((check) => check.key !== 'low_resolution').length;
+  const resolutionIsOnlyHighIssue = highCount === 1 && highChecks[0]?.key === 'low_resolution';
 
   if (!quality.cardDetected || !quality.readable) {
     return gradeCapReason('confidence', { gradeLabel: 'PR 1', psaNumeric: 1 }, 'Image quality or card localization is too poor for a reliable front-only estimate.');
@@ -4381,11 +4514,17 @@ export function observabilityCeilingFromQuality(quality: QualityAssessment): Gra
   if (!quality.fullFrontVisible) {
     return gradeCapReason('confidence', { gradeLabel: 'EX 5', psaNumeric: 5 }, 'Full front borders are not completely visible, so high-grade outcomes are not supportable.');
   }
-  if (highCount >= 2) {
+  if (highNonResolutionCount >= 2) {
     return gradeCapReason('confidence', { gradeLabel: 'VG-EX 4', psaNumeric: 4 }, 'Multiple severe observability issues make the estimate highly conservative.');
   }
-  if (highCount === 1) {
+  if (highNonResolutionCount === 1) {
     return gradeCapReason('confidence', { gradeLabel: 'EX-MT 6', psaNumeric: 6 }, 'One severe observability issue limits how high the pre-grade can reasonably go.');
+  }
+  if (resolutionIsOnlyHighIssue) {
+    if (moderateCount >= 2) {
+      return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Image resolution is low enough to limit slight-defect confidence, with additional moderate observability limits.');
+    }
+    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'Image resolution is low enough that very slight defects may be missed, so the estimate remains conservative.');
   }
   if (moderateCount >= 2) {
     return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Multiple moderate image-quality issues reduce confidence in slight-defect detection.');
@@ -5365,10 +5504,6 @@ function computeConfidence(args: { blurVar: number; glareFrac: number; skewAngle
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
 }
 
 function clampInt(value: number, min: number, max: number): number {
