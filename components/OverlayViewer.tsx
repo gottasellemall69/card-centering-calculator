@@ -4,6 +4,20 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, CSSProperties } from 'react';
 
 import type { CenteringResult, GradeResult } from '@/lib/grader';
+import {
+  DEFAULT_MANUAL_IMAGE_NORMALIZATION,
+  MAX_MANUAL_ROTATION_DEG,
+  MAX_MANUAL_SKEW_DEG,
+  applyAffineToVector,
+  buildFittedImageTransform,
+  buildNormalizationMatrix,
+  clampFloat,
+  clampManualImageNormalization,
+  formatDegrees,
+  isIdentityNormalization,
+  matrixToCss,
+  type ManualImageNormalization
+} from '@/lib/manualAlignment';
 import { centeringCapFromWorstSidePct } from '@/lib/rubric';
 
 const CARD_WIDTH_MM = 63.5;
@@ -11,13 +25,10 @@ const CARD_HEIGHT_MM = 88.9;
 const MIN_CARD_SPAN_PX = 63.5;
 const MIN_INNER_SPAN_PX = 59.5;
 const MIN_BORDER_PX = 3;
-const MAX_ROTATION_DEG = 20;
-const MAX_SKEW_DEG = 20;
+const AUTO_STRAIGHTEN_MIN_CONFIDENCE = 0.35;
 
 type BoundsRect = { minX: number; minY: number; maxX: number; maxY: number; };
 type GuideState = { cardBounds: BoundsRect; innerBounds: BoundsRect; };
-type ImageNormalization = { rotationDeg: number; skewXDeg: number; skewYDeg: number; };
-type AffineMatrix = { a: number; b: number; c: number; d: number; };
 type GuideKey =
   | 'cardLeft'
   | 'innerLeft'
@@ -37,36 +48,49 @@ export type ManualCenteringView = CenteringResult & {
   };
 };
 
-const IDENTITY_MATRIX: AffineMatrix = { a: 1, b: 0, c: 0, d: 1 };
-const DEFAULT_NORMALIZATION: ImageNormalization = { rotationDeg: 0, skewXDeg: 0, skewYDeg: 0 };
-
 export function OverlayViewer( {
   imageDataUrl,
   result,
   manualCentering,
+  manualNormalization,
   alt,
-  onCenteringChange
+  onCenteringChange,
+  onNormalizationChange
 }: {
   imageDataUrl: string;
   alt: string;
   result: GradeResult;
   manualCentering?: ManualCenteringView | null;
+  manualNormalization?: ManualImageNormalization | null;
   onCenteringChange?: ( value: ManualCenteringView | null ) => void;
+  onNormalizationChange?: ( value: ManualImageNormalization | null ) => void;
 } ) {
   const frameRef = useRef<HTMLDivElement | null>( null );
   const [ imageSize, setImageSize ] = useState<{ w: number; h: number; } | null>( null );
   const [ guides, setGuides ] = useState<GuideState | null>( null );
   const [ dragKey, setDragKey ] = useState<GuideKey | null>( null );
-  const [ normalization, setNormalization ] = useState<ImageNormalization>( DEFAULT_NORMALIZATION );
+  const [ normalization, setNormalization ] = useState<ManualImageNormalization>(
+    clampManualImageNormalization( manualNormalization )
+  );
   const [ normalizationAnchor, setNormalizationAnchor ] = useState<{ x: number; y: number; } | null>( null );
+  const [ isAutoStraightening, setIsAutoStraightening ] = useState( false );
+  const [ autoStraightenStatus, setAutoStraightenStatus ] = useState<string | null>( null );
+  const activeNormalizationAnchor = normalizationAnchor ?? normalization.anchor ?? ( guides ? getBoundsCenter( guides.cardBounds ) : null );
 
   useEffect( () => {
     setImageSize( null );
     setGuides( null );
     setDragKey( null );
-    setNormalization( DEFAULT_NORMALIZATION );
+    setNormalization( clampManualImageNormalization( manualNormalization ) );
     setNormalizationAnchor( null );
+    setAutoStraightenStatus( null );
+    setIsAutoStraightening( false );
   }, [ imageDataUrl ] );
+
+  useEffect( () => {
+    const next = clampManualImageNormalization( manualNormalization );
+    setNormalization( ( current ) => ( sameManualNormalization( current, next ) ? current : next ) );
+  }, [ manualNormalization ] );
 
   useEffect( () => {
     if ( !imageSize ) return;
@@ -79,13 +103,22 @@ export function OverlayViewer( {
   }, [ guides, imageSize, onCenteringChange ] );
 
   useEffect( () => {
+    const clamped = clampManualImageNormalization( normalization );
+    if ( activeNormalizationAnchor ) {
+      clamped.anchor = activeNormalizationAnchor;
+    }
+    onNormalizationChange?.( isIdentityNormalization( clamped ) ? null : clamped );
+  }, [ normalization, activeNormalizationAnchor, onNormalizationChange ] );
+
+  useEffect( () => {
     if ( !guides ) return;
     const center = getBoundsCenter( guides.cardBounds );
     setNormalizationAnchor( ( current ) => {
+      if ( manualNormalization?.anchor ) return manualNormalization.anchor;
       if ( !current ) return center;
       return isIdentityNormalization( normalization ) ? center : current;
     } );
-  }, [ guides, normalization ] );
+  }, [ guides, normalization, manualNormalization ] );
 
   useEffect( () => {
     if ( !dragKey || !imageSize ) return;
@@ -114,9 +147,11 @@ export function OverlayViewer( {
     ? buildManualCentering( guides.cardBounds, guides.innerBounds, imageSize.w, imageSize.h )
     : null;
   const cardSize = guides ? getBoundsSize( guides.cardBounds ) : null;
-  const cardTransform = imageSize ? buildImageTransform( imageSize, normalization ) : IDENTITY_MATRIX;
-  const cardTransformOrigin = normalizationAnchor && imageSize
-    ? `${ toXPercent( normalizationAnchor.x, imageSize.w ) }% ${ toYPercent( normalizationAnchor.y, imageSize.h ) }%`
+  const cardTransform = imageSize
+    ? buildFittedImageTransform( imageSize, normalization )
+    : buildFittedImageTransform( { w: 1, h: 1 }, DEFAULT_MANUAL_IMAGE_NORMALIZATION );
+  const cardTransformOrigin = activeNormalizationAnchor && imageSize
+    ? `${ toXPercent( activeNormalizationAnchor.x, imageSize.w ) }% ${ toYPercent( activeNormalizationAnchor.y, imageSize.h ) }%`
     : '50% 50%';
   const cardTransformStyle: CSSProperties = {
     transformOrigin: cardTransformOrigin,
@@ -160,19 +195,73 @@ export function OverlayViewer( {
     setNormalizationAnchor( null );
     setGuides( resolveInitialGuides( result, imageSize, manualCentering ?? null ) );
   };
-  const resetNormalization = () => setNormalization( DEFAULT_NORMALIZATION );
-  const handleNormalizationChange = ( key: keyof ImageNormalization ) => ( event: ChangeEvent<HTMLInputElement> ) => {
-    const limit = key === 'rotationDeg' ? MAX_ROTATION_DEG : MAX_SKEW_DEG;
+  const resetNormalization = () => {
+    setNormalization( { ...DEFAULT_MANUAL_IMAGE_NORMALIZATION } );
+    setAutoStraightenStatus( null );
+  };
+  const handleNormalizationChange = ( key: 'rotationDeg' | 'skewXDeg' | 'skewYDeg' ) => ( event: ChangeEvent<HTMLInputElement> ) => {
+    const limit = key === 'rotationDeg' ? MAX_MANUAL_ROTATION_DEG : MAX_MANUAL_SKEW_DEG;
     const rawValue = Number( event.currentTarget.value );
     const nextValue = Number.isFinite( rawValue ) ? clampFloat( rawValue, -limit, limit ) : 0;
-    setNormalization( ( current ) => ( { ...current, [ key ]: nextValue } ) );
+    setAutoStraightenStatus( null );
+    setNormalization( ( current ) => ( {
+      ...current,
+      [ key ]: nextValue,
+      source: 'manual',
+      confidence: null
+    } ) );
+  };
+  const nudgeNormalization = ( key: 'rotationDeg' | 'skewXDeg' | 'skewYDeg', delta: number ) => {
+    const limit = key === 'rotationDeg' ? MAX_MANUAL_ROTATION_DEG : MAX_MANUAL_SKEW_DEG;
+    setAutoStraightenStatus( null );
+    setNormalization( ( current ) => ( {
+      ...current,
+      [ key ]: clampFloat( current[ key ] + delta, -limit, limit ),
+      source: 'manual',
+      confidence: null
+    } ) );
+  };
+  const autoStraighten = async () => {
+    if ( !guides || !imageSize ) return;
+    setIsAutoStraightening( true );
+    setAutoStraightenStatus( 'Analyzing card edges…' );
+    try {
+      const estimate = await estimateAutoNormalization( imageDataUrl, imageSize, guides );
+      if ( !estimate ) {
+        setAutoStraightenStatus( 'Auto mode could not find stable card edges. Try a quick manual rotation first.' );
+        return;
+      }
+      if ( estimate.confidence < AUTO_STRAIGHTEN_MIN_CONFIDENCE ) {
+        setAutoStraightenStatus(
+          `Auto mode found only weak edge evidence (${ Math.round( estimate.confidence * 100 ) }% confidence). Try tightening the guides around the card or dial in a quick manual rotate first.`
+        );
+        return;
+      }
+      const next = clampManualImageNormalization( {
+        ...estimate.normalization,
+        anchor: activeNormalizationAnchor ?? getBoundsCenter( guides.cardBounds ),
+        source: 'auto',
+        confidence: estimate.confidence
+      } );
+      setNormalization( next );
+      setAutoStraightenStatus(
+        `Auto straighten applied (${ Math.round( estimate.confidence * 100 ) }% confidence): rotate ${ formatDegrees( next.rotationDeg ) }, skew X ${ formatDegrees( next.skewXDeg ) }, skew Y ${ formatDegrees( next.skewYDeg ) }.`
+      );
+    } catch ( error ) {
+      setAutoStraightenStatus( error instanceof Error ? error.message : 'Auto straighten failed.' );
+    } finally {
+      setIsAutoStraightening( false );
+    }
   };
 
   return (
     <div className="overlayViewer">
       <div className="overlayViewerToolbar">
-        <div className="small">Rotate or deskew the photo until the card edges look straight, then drag the dotted guides to set the card edge and inner frame.</div>
+        <div className="small">Use Auto straighten for a starting point, then fine-tune rotate/skew and drag the dotted guides until the card and inner frame sit square.</div>
         <div className="overlayViewerToolbarActions">
+          <button type="button" className="btn btnPrimary" onClick={() => void autoStraighten()} disabled={!guides || !imageSize || isAutoStraightening}>
+            {isAutoStraightening ? 'Auto straightening…' : 'Auto straighten'}
+          </button>
           <button type="button" className="btn" onClick={resetNormalization} disabled={!hasNormalization}>Reset normalize</button>
           <button type="button" className="btn" onClick={resetGuides}>Reset guides</button>
         </div>
@@ -211,31 +300,37 @@ export function OverlayViewer( {
         <div className="overlayViewerStage">
           <section className="overlayViewerNormalizePanel">
             <div className="overlayViewerPanelLabel">Normalize</div>
-            <div className="small">Viewer-only affine adjustments applied inside the current outer guide box.</div>
+            <div className="small">These adjustments are applied during grading too, so the manual overlay and final estimate use the same straightened view.</div>
+            {autoStraightenStatus ? (
+              <div className="overlayViewerStatus">{autoStraightenStatus}</div>
+            ) : null}
             <div className="overlayViewerControlRow">
               <NormalizationControl
                 label="Rotate"
                 value={normalization.rotationDeg}
-                min={-MAX_ROTATION_DEG}
-                max={MAX_ROTATION_DEG}
+                min={-MAX_MANUAL_ROTATION_DEG}
+                max={MAX_MANUAL_ROTATION_DEG}
                 step={0.1}
                 onChange={handleNormalizationChange( 'rotationDeg' )}
+                onNudge={( delta ) => nudgeNormalization( 'rotationDeg', delta )}
               />
               <NormalizationControl
                 label="Skew X"
                 value={normalization.skewXDeg}
-                min={-MAX_SKEW_DEG}
-                max={MAX_SKEW_DEG}
+                min={-MAX_MANUAL_SKEW_DEG}
+                max={MAX_MANUAL_SKEW_DEG}
                 step={0.1}
                 onChange={handleNormalizationChange( 'skewXDeg' )}
+                onNudge={( delta ) => nudgeNormalization( 'skewXDeg', delta )}
               />
               <NormalizationControl
                 label="Skew Y"
                 value={normalization.skewYDeg}
-                min={-MAX_SKEW_DEG}
-                max={MAX_SKEW_DEG}
+                min={-MAX_MANUAL_SKEW_DEG}
+                max={MAX_MANUAL_SKEW_DEG}
                 step={0.1}
                 onChange={handleNormalizationChange( 'skewYDeg' )}
+                onNudge={( delta ) => nudgeNormalization( 'skewYDeg', delta )}
               />
             </div>
           </section>
@@ -349,7 +444,8 @@ function NormalizationControl( {
   min,
   max,
   step,
-  onChange
+  onChange,
+  onNudge
 }: {
   label: string;
   value: number;
@@ -357,6 +453,7 @@ function NormalizationControl( {
   max: number;
   step: number;
   onChange: ( event: ChangeEvent<HTMLInputElement> ) => void;
+  onNudge: ( delta: number ) => void;
 } ) {
   return (
     <label className="overlayViewerControl">
@@ -364,6 +461,12 @@ function NormalizationControl( {
         <span>{label}</span>
         <span>{formatDegrees( value )}</span>
       </span>
+      <div className="overlayViewerNudgeRow">
+        <button type="button" className="btn overlayViewerNudgeButton" onClick={() => onNudge( -1 )}>-1°</button>
+        <button type="button" className="btn overlayViewerNudgeButton" onClick={() => onNudge( -0.1 )}>-0.1°</button>
+        <button type="button" className="btn overlayViewerNudgeButton" onClick={() => onNudge( 0.1 )}>+0.1°</button>
+        <button type="button" className="btn overlayViewerNudgeButton" onClick={() => onNudge( 1 )}>+1°</button>
+      </div>
       <input
         className="overlayViewerRange"
         type="range"
@@ -800,69 +903,413 @@ function asFiniteNumber( value: unknown ): number | null {
   return typeof value === 'number' && Number.isFinite( value ) ? value : null;
 }
 
-function buildImageTransform(
+type EdgeSamplePoint = { x: number; y: number; score: number };
+
+type FittedEdgeLine = {
+  orientation: 'horizontal' | 'vertical';
+  slope: number;
+  intercept: number;
+  confidence: number;
+  support: number;
+};
+
+type AutoNormalizationEstimate = {
+  normalization: ManualImageNormalization;
+  confidence: number;
+};
+
+async function estimateAutoNormalization(
+  imageDataUrl: string,
   imageSize: { w: number; h: number; },
-  normalization: ImageNormalization
-): AffineMatrix {
-  const rotation = rotationMatrix( normalization.rotationDeg );
-  const skewX = skewXMatrix( normalization.skewXDeg );
-  const skewY = skewYMatrix( normalization.skewYDeg );
-  const combined = multiplyAffineMatrices( rotation, multiplyAffineMatrices( skewY, skewX ) );
-  const boundsWidth = ( Math.abs( combined.a ) * imageSize.w ) + ( Math.abs( combined.c ) * imageSize.h );
-  const boundsHeight = ( Math.abs( combined.b ) * imageSize.w ) + ( Math.abs( combined.d ) * imageSize.h );
-  const fitScale = Math.min(
-    1,
-    imageSize.w / Math.max( 1, boundsWidth ),
-    imageSize.h / Math.max( 1, boundsHeight )
+  guides: GuideState
+): Promise<AutoNormalizationEstimate | null> {
+  const analyzed = await loadGrayImageForAutoStraighten( imageDataUrl, imageSize );
+  const scaledGuides = {
+    cardBounds: scaleBoundsBetweenSizes( guides.cardBounds, imageSize, { w: analyzed.width, h: analyzed.height } ),
+    innerBounds: scaleBoundsBetweenSizes( guides.innerBounds, imageSize, { w: analyzed.width, h: analyzed.height } )
+  };
+  const lines = detectCardEdgeLines( analyzed.gray, analyzed.width, analyzed.height, scaledGuides.cardBounds );
+  const horizontalLines = [ lines.top, lines.bottom ].filter( ( line ): line is FittedEdgeLine => !!line );
+  const verticalLines = [ lines.left, lines.right ].filter( ( line ): line is FittedEdgeLine => !!line );
+  if ( horizontalLines.length === 0 || verticalLines.length === 0 ) return null;
+
+  const normalization = solveAutoNormalizationFromLines( horizontalLines, verticalLines );
+  const confidence = clampFloat(
+    ( horizontalLines.reduce( ( sum, line ) => sum + line.confidence, 0 ) / horizontalLines.length ) * 0.5
+      + ( verticalLines.reduce( ( sum, line ) => sum + line.confidence, 0 ) / verticalLines.length ) * 0.5,
+    0,
+    1
   );
-  return scaleAffineMatrix( combined, fitScale );
-}
-
-function rotationMatrix( rotationDeg: number ): AffineMatrix {
-  const angleRad = ( rotationDeg * Math.PI ) / 180;
-  const cos = Math.cos( angleRad );
-  const sin = Math.sin( angleRad );
-  return { a: cos, b: sin, c: -sin, d: cos };
-}
-
-function skewXMatrix( skewDeg: number ): AffineMatrix {
-  return { a: 1, b: 0, c: Math.tan( ( skewDeg * Math.PI ) / 180 ), d: 1 };
-}
-
-function skewYMatrix( skewDeg: number ): AffineMatrix {
-  return { a: 1, b: Math.tan( ( skewDeg * Math.PI ) / 180 ), c: 0, d: 1 };
-}
-
-function scaleAffineMatrix( matrix: AffineMatrix, scale: number ): AffineMatrix {
   return {
-    a: matrix.a * scale,
-    b: matrix.b * scale,
-    c: matrix.c * scale,
-    d: matrix.d * scale
+    normalization,
+    confidence
   };
 }
 
-function multiplyAffineMatrices( left: AffineMatrix, right: AffineMatrix ): AffineMatrix {
+async function loadGrayImageForAutoStraighten(
+  imageDataUrl: string,
+  imageSize: { w: number; h: number; }
+): Promise<{ gray: Float32Array; width: number; height: number }> {
+  const response = await fetch( imageDataUrl );
+  const blob = await response.blob();
+  const bitmap = await createImageBitmap( blob );
+  const longEdge = Math.max( imageSize.w, imageSize.h );
+  const scale = longEdge > 1600 ? 1600 / longEdge : 1;
+  const width = Math.max( 1, Math.round( imageSize.w * scale ) );
+  const height = Math.max( 1, Math.round( imageSize.h * scale ) );
+  const canvas = document.createElement( 'canvas' );
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext( '2d', { willReadFrequently: true } );
+  if ( !ctx ) {
+    if ( 'close' in bitmap ) bitmap.close();
+    throw new Error( 'Auto straighten could not access a 2D canvas.' );
+  }
+  ctx.drawImage( bitmap, 0, 0, width, height );
+  if ( 'close' in bitmap ) bitmap.close();
+  const data = ctx.getImageData( 0, 0, width, height ).data;
+  const gray = new Float32Array( width * height );
+  for ( let index = 0; index < gray.length; index++ ) {
+    const offset = index * 4;
+    gray[ index ] = data[ offset ] * 0.299 + data[ offset + 1 ] * 0.587 + data[ offset + 2 ] * 0.114;
+  }
+  return { gray, width, height };
+}
+
+function detectCardEdgeLines(
+  gray: Float32Array,
+  width: number,
+  height: number,
+  bounds: BoundsRect
+): {
+  top: FittedEdgeLine | null;
+  bottom: FittedEdgeLine | null;
+  left: FittedEdgeLine | null;
+  right: FittedEdgeLine | null;
+} {
   return {
-    a: ( left.a * right.a ) + ( left.c * right.b ),
-    b: ( left.b * right.a ) + ( left.d * right.b ),
-    c: ( left.a * right.c ) + ( left.c * right.d ),
-    d: ( left.b * right.c ) + ( left.d * right.d )
+    top: fitEdgeLine( sampleEdgePoints( gray, width, height, bounds, 'top' ), 'horizontal' ),
+    bottom: fitEdgeLine( sampleEdgePoints( gray, width, height, bounds, 'bottom' ), 'horizontal' ),
+    left: fitEdgeLine( sampleEdgePoints( gray, width, height, bounds, 'left' ), 'vertical' ),
+    right: fitEdgeLine( sampleEdgePoints( gray, width, height, bounds, 'right' ), 'vertical' )
   };
 }
 
-function matrixToCss( matrix: AffineMatrix ): string {
-  return `matrix(${ matrix.a.toFixed( 6 ) }, ${ matrix.b.toFixed( 6 ) }, ${ matrix.c.toFixed( 6 ) }, ${ matrix.d.toFixed( 6 ) }, 0, 0)`;
+function sampleEdgePoints(
+  gray: Float32Array,
+  width: number,
+  height: number,
+  bounds: BoundsRect,
+  side: 'top' | 'bottom' | 'left' | 'right'
+): EdgeSamplePoint[] {
+  const cardWidth = Math.max( 1, bounds.maxX - bounds.minX + 1 );
+  const cardHeight = Math.max( 1, bounds.maxY - bounds.minY + 1 );
+  const alongStep = clampInt( Math.min( cardWidth, cardHeight ) / 90, 2, 8 );
+  const marginX = clampInt( cardWidth * 0.08, 6, Math.max( 6, Math.round( cardWidth * 0.2 ) ) );
+  const marginY = clampInt( cardHeight * 0.08, 6, Math.max( 6, Math.round( cardHeight * 0.2 ) ) );
+  const searchDepth = side === 'top' || side === 'bottom'
+    ? clampInt( cardHeight * 0.2, 12, Math.max( 12, Math.round( cardHeight * 0.38 ) ) )
+    : clampInt( cardWidth * 0.2, 12, Math.max( 12, Math.round( cardWidth * 0.38 ) ) );
+  const points: EdgeSamplePoint[] = [];
+
+  if ( side === 'top' || side === 'bottom' ) {
+    for ( let x = bounds.minX + marginX; x <= bounds.maxX - marginX; x += alongStep ) {
+      let bestY = -1;
+      let bestScore = 0;
+      for ( let depth = 2; depth <= searchDepth - 2; depth++ ) {
+        const y = side === 'top' ? bounds.minY + depth : bounds.maxY - depth;
+        if ( y <= 2 || y >= height - 3 ) continue;
+        const outside = meanBandSample(
+          gray,
+          width,
+          height,
+          x,
+          y,
+          'horizontal',
+          side === 'top' ? -4 : 1,
+          side === 'top' ? -1 : 4,
+          2
+        );
+        const inside = meanBandSample(
+          gray,
+          width,
+          height,
+          x,
+          y,
+          'horizontal',
+          side === 'top' ? 1 : -4,
+          side === 'top' ? 4 : -1,
+          2
+        );
+        const score = Math.abs( inside - outside );
+        if ( score > bestScore ) {
+          bestScore = score;
+          bestY = y;
+        }
+      }
+      if ( bestY >= 0 ) {
+        points.push( { x, y: bestY, score: bestScore } );
+      }
+    }
+  } else {
+    for ( let y = bounds.minY + marginY; y <= bounds.maxY - marginY; y += alongStep ) {
+      let bestX = -1;
+      let bestScore = 0;
+      for ( let depth = 2; depth <= searchDepth - 2; depth++ ) {
+        const x = side === 'left' ? bounds.minX + depth : bounds.maxX - depth;
+        if ( x <= 2 || x >= width - 3 ) continue;
+        const outside = meanBandSample(
+          gray,
+          width,
+          height,
+          x,
+          y,
+          'vertical',
+          side === 'left' ? -4 : 1,
+          side === 'left' ? -1 : 4,
+          2
+        );
+        const inside = meanBandSample(
+          gray,
+          width,
+          height,
+          x,
+          y,
+          'vertical',
+          side === 'left' ? 1 : -4,
+          side === 'left' ? 4 : -1,
+          2
+        );
+        const score = Math.abs( inside - outside );
+        if ( score > bestScore ) {
+          bestScore = score;
+          bestX = x;
+        }
+      }
+      if ( bestX >= 0 ) {
+        points.push( { x: bestX, y, score: bestScore } );
+      }
+    }
+  }
+
+  if ( points.length < 8 ) return [];
+  const scoreFloor = Math.max( 6, percentile( points.map( ( point ) => point.score ), 0.45 ) );
+  return points.filter( ( point ) => point.score >= scoreFloor );
 }
 
-function formatDegrees( value: number ): string {
-  return `${ value >= 0 ? '+' : '' }${ value.toFixed( 1 ) }°`;
+function meanBandSample(
+  gray: Float32Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  axis: 'horizontal' | 'vertical',
+  startOffset: number,
+  endOffset: number,
+  radius: number
+): number {
+  let sum = 0;
+  let count = 0;
+  const from = Math.min( startOffset, endOffset );
+  const to = Math.max( startOffset, endOffset );
+  for ( let primary = from; primary <= to; primary++ ) {
+    for ( let secondary = -radius; secondary <= radius; secondary++ ) {
+      const sampleX = axis === 'horizontal' ? x + secondary : x + primary;
+      const sampleY = axis === 'horizontal' ? y + primary : y + secondary;
+      const clampedX = clampInt( sampleX, 0, Math.max( 0, width - 1 ) );
+      const clampedY = clampInt( sampleY, 0, Math.max( 0, height - 1 ) );
+      const index = ( clampedY * width ) + clampedX;
+      if ( index < 0 || index >= gray.length ) continue;
+      sum += gray[ index ];
+      count++;
+    }
+  }
+  return count ? sum / count : 0;
 }
 
-function isIdentityNormalization( normalization: ImageNormalization ): boolean {
-  return Math.abs( normalization.rotationDeg ) < 0.001
-    && Math.abs( normalization.skewXDeg ) < 0.001
-    && Math.abs( normalization.skewYDeg ) < 0.001;
+function fitEdgeLine(
+  points: EdgeSamplePoint[],
+  orientation: 'horizontal' | 'vertical'
+): FittedEdgeLine | null {
+  if ( points.length < 6 ) return null;
+  const regression = regressLine( points, orientation );
+  if ( !regression ) return null;
+  const residuals = points.map( ( point ) => Math.abs( pointResidual( point, orientation, regression.slope, regression.intercept ) ) );
+  const residualMedian = percentile( residuals, 0.5 );
+  const filtered = points.filter( ( point ) => (
+    Math.abs( pointResidual( point, orientation, regression.slope, regression.intercept ) ) <= Math.max( 1.8, residualMedian * 2.8 )
+  ) );
+  const finalFit = regressLine( filtered.length >= 6 ? filtered : points, orientation );
+  if ( !finalFit ) return null;
+  const meanScore = ( filtered.length >= 6 ? filtered : points ).reduce( ( sum, point ) => sum + point.score, 0 ) / Math.max( 1, filtered.length >= 6 ? filtered.length : points.length );
+  return {
+    orientation,
+    slope: finalFit.slope,
+    intercept: finalFit.intercept,
+    support: filtered.length >= 6 ? filtered.length : points.length,
+    confidence: clampFloat(
+      ( ( filtered.length >= 6 ? filtered.length : points.length ) / Math.max( 8, points.length ) ) * 0.45
+      + clampFloat( meanScore / 28, 0, 1 ) * 0.55,
+      0,
+      1
+    )
+  };
+}
+
+function regressLine(
+  points: EdgeSamplePoint[],
+  orientation: 'horizontal' | 'vertical'
+): { slope: number; intercept: number } | null {
+  if ( points.length < 2 ) return null;
+  const independent = points.map( ( point ) => orientation === 'horizontal' ? point.x : point.y );
+  const dependent = points.map( ( point ) => orientation === 'horizontal' ? point.y : point.x );
+  const meanIndependent = independent.reduce( ( sum, value ) => sum + value, 0 ) / independent.length;
+  const meanDependent = dependent.reduce( ( sum, value ) => sum + value, 0 ) / dependent.length;
+  let numerator = 0;
+  let denominator = 0;
+  for ( let index = 0; index < independent.length; index++ ) {
+    const deltaIndependent = independent[ index ] - meanIndependent;
+    numerator += deltaIndependent * ( dependent[ index ] - meanDependent );
+    denominator += deltaIndependent * deltaIndependent;
+  }
+  if ( Math.abs( denominator ) < 1e-6 ) return null;
+  const slope = numerator / denominator;
+  const intercept = meanDependent - ( slope * meanIndependent );
+  return { slope, intercept };
+}
+
+function pointResidual(
+  point: EdgeSamplePoint,
+  orientation: 'horizontal' | 'vertical',
+  slope: number,
+  intercept: number
+): number {
+  return orientation === 'horizontal'
+    ? point.y - ( slope * point.x ) - intercept
+    : point.x - ( slope * point.y ) - intercept;
+}
+
+function solveAutoNormalizationFromLines(
+  horizontalLines: FittedEdgeLine[],
+  verticalLines: FittedEdgeLine[]
+): ManualImageNormalization {
+  const averageHorizontalAngle = horizontalLines.reduce( ( sum, line ) => sum + ( Math.atan( line.slope ) * 180 ) / Math.PI, 0 ) / horizontalLines.length;
+  let best = clampManualImageNormalization( {
+    ...DEFAULT_MANUAL_IMAGE_NORMALIZATION,
+    rotationDeg: clampFloat( -averageHorizontalAngle, -MAX_MANUAL_ROTATION_DEG, MAX_MANUAL_ROTATION_DEG ),
+    source: 'auto'
+  } );
+  let bestCost = normalizationCost( best, horizontalLines, verticalLines );
+
+  for ( const step of [ 4, 2, 1, 0.5, 0.25, 0.1 ] ) {
+    let improved = true;
+    while ( improved ) {
+      improved = false;
+      for ( const key of [ 'rotationDeg', 'skewXDeg', 'skewYDeg' ] as const ) {
+        for ( const delta of [ -step, step ] ) {
+          const candidate = clampManualImageNormalization( {
+            ...best,
+            [ key ]: best[ key ] + delta,
+            source: 'auto'
+          } );
+          const cost = normalizationCost( candidate, horizontalLines, verticalLines );
+          if ( cost + 1e-6 < bestCost ) {
+            best = candidate;
+            bestCost = cost;
+            improved = true;
+          }
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+function normalizationCost(
+  normalization: ManualImageNormalization,
+  horizontalLines: FittedEdgeLine[],
+  verticalLines: FittedEdgeLine[]
+): number {
+  const matrix = buildNormalizationMatrix( normalization );
+  let cost = 0;
+
+  for ( const line of horizontalLines ) {
+    const transformed = applyAffineToVector( matrix, { x: 1, y: line.slope } );
+    const length = Math.hypot( transformed.x, transformed.y ) || 1;
+    const tilt = transformed.y / length;
+    cost += tilt * tilt * ( 1 + line.confidence );
+  }
+
+  for ( const line of verticalLines ) {
+    const transformed = applyAffineToVector( matrix, { x: line.slope, y: 1 } );
+    const length = Math.hypot( transformed.x, transformed.y ) || 1;
+    const tilt = transformed.x / length;
+    cost += tilt * tilt * ( 1 + line.confidence );
+  }
+
+  const horizontalMean = meanDirectionAfterTransform( matrix, horizontalLines, 'horizontal' );
+  const verticalMean = meanDirectionAfterTransform( matrix, verticalLines, 'vertical' );
+  if ( horizontalMean && verticalMean ) {
+    const dot = Math.abs( ( horizontalMean.x * verticalMean.x ) + ( horizontalMean.y * verticalMean.y ) );
+    cost += dot * dot * 0.6;
+  }
+
+  return cost;
+}
+
+function meanDirectionAfterTransform(
+  matrix: ReturnType<typeof buildNormalizationMatrix>,
+  lines: FittedEdgeLine[],
+  kind: 'horizontal' | 'vertical'
+): { x: number; y: number } | null {
+  if ( lines.length === 0 ) return null;
+  let sumX = 0;
+  let sumY = 0;
+  for ( const line of lines ) {
+    const transformed = applyAffineToVector(
+      matrix,
+      kind === 'horizontal' ? { x: 1, y: line.slope } : { x: line.slope, y: 1 }
+    );
+    const length = Math.hypot( transformed.x, transformed.y ) || 1;
+    sumX += transformed.x / length;
+    sumY += transformed.y / length;
+  }
+  const length = Math.hypot( sumX, sumY ) || 1;
+  return { x: sumX / length, y: sumY / length };
+}
+
+function percentile( values: number[], ratio: number ): number {
+  if ( values.length === 0 ) return 0;
+  const sorted = [ ...values ].sort( ( a, b ) => a - b );
+  const index = clampInt( ratio * ( sorted.length - 1 ), 0, sorted.length - 1 );
+  return sorted[ index ];
+}
+
+function sameManualNormalization(
+  left: ManualImageNormalization | null | undefined,
+  right: ManualImageNormalization | null | undefined
+): boolean {
+  const a = clampManualImageNormalization( left );
+  const b = clampManualImageNormalization( right );
+  const aAnchor = a.anchor ?? null;
+  const bAnchor = b.anchor ?? null;
+  return (
+    Math.abs( a.rotationDeg - b.rotationDeg ) < 0.001
+    && Math.abs( a.skewXDeg - b.skewXDeg ) < 0.001
+    && Math.abs( a.skewYDeg - b.skewYDeg ) < 0.001
+    && a.source === b.source
+    && Math.abs( ( a.confidence ?? 0 ) - ( b.confidence ?? 0 ) ) < 0.001
+    && (
+      ( aAnchor == null && bAnchor == null )
+      || (
+        aAnchor != null
+        && bAnchor != null
+        && Math.abs( aAnchor.x - bAnchor.x ) < 0.5
+        && Math.abs( aAnchor.y - bAnchor.y ) < 0.5
+      )
+    )
+  );
 }
 
 function getBoundsSize( bounds: BoundsRect ): { w: number; h: number; } {
@@ -913,8 +1360,4 @@ function pxToMillimeters( px: number, axisPx: number, physicalMm: number ): numb
 
 function clampInt( value: number, min: number, max: number ): number {
   return Math.max( min, Math.min( max, Math.round( value ) ) );
-}
-
-function clampFloat( value: number, min: number, max: number ): number {
-  return Math.max( min, Math.min( max, value ) );
 }

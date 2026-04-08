@@ -126,12 +126,12 @@ const TCGPLAYER_POINT_BANDS: Array<{
   minPoints: number;
   maxPoints: number | null;
 }> = [
-  { condition: 'Near Mint', minPoints: 0, maxPoints: 3 },
-  { condition: 'Lightly Played', minPoints: 4, maxPoints: 6 },
-  { condition: 'Moderately Played', minPoints: 7, maxPoints: 12 },
-  { condition: 'Heavily Played', minPoints: 13, maxPoints: 24 },
-  { condition: 'Damaged', minPoints: 25, maxPoints: null }
-];
+    { condition: 'Near Mint', minPoints: 0, maxPoints: 7 },
+    { condition: 'Lightly Played', minPoints: 8, maxPoints: 14 },
+    { condition: 'Moderately Played', minPoints: 15, maxPoints: 21 },
+    { condition: 'Heavily Played', minPoints: 22, maxPoints: 28 },
+    { condition: 'Damaged', minPoints: 29, maxPoints: null }
+  ];
 
 const PSA_FLAW_PROFILE_CAPS: Array<{ maxPoints: number; condition: string; gradeCap: GradeCap; }> = [
   { maxPoints: 0, condition: 'PSA 10 profile', gradeCap: { gradeLabel: 'GEM-MT 10', psaNumeric: 10 } },
@@ -225,7 +225,11 @@ export const TCGPLAYER_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
       Minor: '27.72cm²',
       Moderate: '55.44cm²',
       Major: '110.88cm²'
-    }
+    },
+    notes: [
+      'For holographic, embossed, etched, or glitter finishes, broad factory texture should not be scored as scuffing by itself.',
+      'Prefer localized disruptions, gloss breaks, or non-uniform patches that stand apart from the card\'s expected finish pattern.'
+    ]
   },
   Edgewear: {
     measuredBy: 'Sum of length',
@@ -257,7 +261,7 @@ export const TCGPLAYER_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
       Minor: '13.75cm²',
       Moderate: '27.5cm²'
     },
-    notes: ['Major threshold not specified in the workbook']
+    notes: [ 'Major threshold not specified in the workbook' ]
   },
   Bend: {
     measuredBy: 'Sum of length',
@@ -274,7 +278,11 @@ export const TCGPLAYER_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
       Minor: '1cm²',
       Moderate: '4cm²',
       Major: '16cm²'
-    }
+    },
+    notes: [
+      'On textured foil or embossed stock, decorative sparkle or emboss grain should not be treated as wear unless it becomes localized, inconsistent, or broken.',
+      'Border texture should be compared against the expected factory finish before treating it as whitening or surface loss.'
+    ]
   },
   Curling: {
     measuredBy: 'Curl height',

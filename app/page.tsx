@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 
-import type { GradeResult, ManualGuideOverride } from '@/lib/grader';
+import type { GradeResult, ManualGuideOverride, SurfaceFinishMode } from '@/lib/grader';
+import type { ManualImageNormalization } from '@/lib/manualAlignment';
+import { isIdentityNormalization } from '@/lib/manualAlignment';
 import { OverlayViewer, type ManualCenteringView } from '@/components/OverlayViewer';
 import { flattenGradeResult, serializeGradeRowsToCsv } from '@/lib/resultExport';
 import { finalGradeFromCaps } from '@/lib/rubric';
@@ -21,6 +23,8 @@ type Row = {
   preview?: GradeResult;
   result?: GradeResult;
   manualCentering?: ManualCenteringView | null;
+  manualNormalization?: ManualImageNormalization | null;
+  surfaceFinishMode: SurfaceFinishMode;
   error?: string;
   sourceObjectURL: string;
   overlayObjectURL?: string;
@@ -97,12 +101,30 @@ export default function Page() {
   const selected = useMemo(() => rows.find((row) => row.id === selectedId) ?? null, [rows, selectedId]);
   const selectedSeedResult = selected?.result ?? selected?.preview ?? null;
   const displayedResult = useMemo(
-    () => (selected?.result ? applyManualCenteringOverride(selected.result, selected.manualCentering ?? null) : null),
+    () => (
+      selected?.result
+        ? applyManualCenteringOverride(
+          selected.result,
+          selected.manualCentering ?? null,
+          selected.manualNormalization ?? null
+        )
+        : null
+    ),
     [selected]
   );
   const displayCentering = selected?.manualCentering ?? displayedResult?.centering ?? selectedSeedResult?.centering ?? null;
   const displayMm = deriveCenteringMillimeters(displayCentering);
-  const estimateNeedsRefresh = !!selected?.result && !sameCentering(selected.result.centering, selected.manualCentering);
+  const estimateNeedsRefresh = !!selected?.result && (
+    !sameCentering(selected.result.centering, selected.manualCentering)
+    || !sameNormalization(
+      readManualNormalizationFromResult(selected.result),
+      selected.manualNormalization ?? null
+    )
+    || !sameSurfaceFinishMode(
+      readSurfaceFinishModeFromResult(selected.result),
+      selected.surfaceFinishMode ?? 'standard'
+    )
+  );
 
   const handleSelectedCenteringChange = useCallback((value: ManualCenteringView | null) => {
     if (!selectedId) return;
@@ -356,7 +378,9 @@ export default function Page() {
           file,
           status: 'PENDING',
           sourceObjectURL: URL.createObjectURL(file),
-          manualCentering: null
+          manualCentering: null,
+          manualNormalization: null,
+          surfaceFinishMode: 'standard'
         };
         return { file, row };
       });
@@ -470,13 +494,22 @@ export default function Page() {
     )));
 
     try {
-      const manualGuideOverride = toManualGuideOverride(selected.manualCentering ?? null);
+      const manualGuideOverride = toManualGuideOverride(
+        selectedSeedResult?.centering ?? null,
+        selected.manualCentering ?? null,
+        selected.manualNormalization ?? null,
+        selected.surfaceFinishMode ?? 'standard'
+      );
       const { result: gradedResult, overlayBlob, rectifiedBlob, engine } = await gradeWithRecovery(
         selected.id,
         selected.file,
         manualGuideOverride
       );
-      const finalResult = applyManualCenteringOverride(gradedResult, selected.manualCentering ?? null);
+      const finalResult = applyManualCenteringOverride(
+        gradedResult,
+        selected.manualCentering ?? null,
+        selected.manualNormalization ?? null
+      );
       const overlayObjectURL = URL.createObjectURL(overlayBlob);
       const rectifiedObjectURL = URL.createObjectURL(rectifiedBlob);
       revokeObjectUrlSafe(selected.overlayObjectURL);
@@ -723,7 +756,13 @@ export default function Page() {
                 </tr>
               ) : (
                 rows.map((row) => {
-                  const displayRowResult = row.result ? applyManualCenteringOverride(row.result, row.manualCentering ?? null) : null;
+                  const displayRowResult = row.result
+                    ? applyManualCenteringOverride(
+                      row.result,
+                      row.manualCentering ?? null,
+                      row.manualNormalization ?? null
+                    )
+                    : null;
                   const previewNumeric = row.preview?.final?.psaNumeric;
                   const estimatedNumeric = displayRowResult?.final?.psaNumeric ?? null;
                   return (
@@ -855,9 +894,31 @@ export default function Page() {
 
             {estimateNeedsRefresh ? (
               <div className="notice" style={{ marginTop: 10 }}>
-                Guides changed after the last estimate. Click Re-estimate grade to apply the current measurement area to the current result.
+                Guides, straightening, or surface mode changed after the last estimate. Click Re-estimate grade to apply the current alignment and detection settings to the current result.
               </div>
             ) : null}
+
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ marginBottom: 6 }}>Detection mode</div>
+              <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={(selected.surfaceFinishMode ?? 'standard') === 'textured'}
+                  onChange={(event) => {
+                    const nextMode: SurfaceFinishMode = event.currentTarget.checked ? 'textured' : 'standard';
+                    setRows((prev) => prev.map((row) => (
+                      row.id === selected.id && row.surfaceFinishMode !== nextMode
+                        ? { ...row, surfaceFinishMode: nextMode }
+                        : row
+                    )));
+                  }}
+                />
+                Holographic / embossed / textured finish
+              </label>
+              <div className="small" style={{ marginTop: 6 }}>
+                Use this when the card has factory foil, etched, glitter, or embossed texture that should not be scored like generic scuffing.
+              </div>
+            </div>
 
             <hr />
 
@@ -866,8 +927,21 @@ export default function Page() {
               imageDataUrl={selected.sourceObjectURL}
               result={selectedSeedResult}
               manualCentering={selected.manualCentering ?? null}
+              manualNormalization={selected.manualNormalization ?? null}
               alt={selected.filename}
               onCenteringChange={handleSelectedCenteringChange}
+              onNormalizationChange={(value) => {
+                setRows((prev) => {
+                  let changed = false;
+                  const next = prev.map((row) => {
+                    if (row.id !== selected.id) return row;
+                    if (sameNormalization(row.manualNormalization ?? null, value ?? null)) return row;
+                    changed = true;
+                    return { ...row, manualNormalization: value ?? null };
+                  });
+                  return changed ? next : prev;
+                });
+              }}
             />
 
             <hr />
@@ -882,6 +956,18 @@ export default function Page() {
             <div className="kv"><div className="small">Centering cap</div><div>{displayCentering?.gradeCap?.gradeLabel ?? '-'}</div></div>
             <div className="kv"><div className="small">L/R thickness</div><div>{displayMm ? `${displayMm.left.toFixed(1)}mm / ${displayMm.right.toFixed(1)}mm` : '-'}</div></div>
             <div className="kv"><div className="small">T/B thickness</div><div>{displayMm ? `${displayMm.top.toFixed(1)}mm / ${displayMm.bottom.toFixed(1)}mm` : '-'}</div></div>
+            <div className="kv">
+              <div className="small">Straighten</div>
+              <div>
+                {selected.manualNormalization && !isIdentityNormalization(selected.manualNormalization)
+                  ? `Rotate ${selected.manualNormalization.rotationDeg.toFixed(1)}°, Skew X ${selected.manualNormalization.skewXDeg.toFixed(1)}°, Skew Y ${selected.manualNormalization.skewYDeg.toFixed(1)}°`
+                  : 'None'}
+              </div>
+            </div>
+            <div className="kv">
+              <div className="small">Surface mode</div>
+              <div>{(selected.surfaceFinishMode ?? 'standard') === 'textured' ? 'Textured / holographic / embossed' : 'Standard'}</div>
+            </div>
 
             {displayedResult ? (
               <>
@@ -998,7 +1084,11 @@ export default function Page() {
   );
 }
 
-function applyManualCenteringOverride(result: GradeResult, manualCentering: ManualCenteringView | null | undefined): GradeResult {
+function applyManualCenteringOverride(
+  result: GradeResult,
+  manualCentering: ManualCenteringView | null | undefined,
+  manualNormalization: ManualImageNormalization | null | undefined
+): GradeResult {
   if (!manualCentering || !result.centering || !result.flaws || result.final.unscorable) {
     return result;
   }
@@ -1037,6 +1127,7 @@ function applyManualCenteringOverride(result: GradeResult, manualCentering: Manu
     debug: {
       ...(result.debug ?? {}),
       manualCenteringApplied: true,
+      manualNormalization: manualNormalization ?? readManualNormalizationFromResult(result) ?? null,
       manualCentering: {
         lr: manualCentering.lr,
         tb: manualCentering.tb,
@@ -1055,11 +1146,17 @@ function hasResult(row: Row): row is Row & { result: GradeResult } {
   return Boolean(row.result);
 }
 
-function toManualGuideOverride(manualCentering: ManualCenteringView | null | undefined): ManualGuideOverride | null {
-  if (!manualCentering) return null;
-  const sourceSize = manualCentering.debug?.rectifiedSize;
-  const cardRect = manualCentering.debug?.cardRect;
-  const innerRect = manualCentering.debug?.innerRect;
+function toManualGuideOverride(
+  seedCentering: GradeResult['centering'] | null | undefined,
+  manualCentering: ManualCenteringView | null | undefined,
+  manualNormalization: ManualImageNormalization | null | undefined,
+  surfaceFinishMode: SurfaceFinishMode
+): ManualGuideOverride | null {
+  const guideSource = manualCentering ?? seedCentering ?? null;
+  if (!guideSource) return null;
+  const sourceSize = guideSource.debug?.rectifiedSize;
+  const cardRect = guideSource.debug?.cardRect;
+  const innerRect = guideSource.debug?.innerRect;
   if (!sourceSize || !cardRect || !innerRect) return null;
   if (sourceSize.w <= 2 || sourceSize.h <= 2) return null;
   if (cardRect.w <= 1 || cardRect.h <= 1 || innerRect.w <= 1 || innerRect.h <= 1) return null;
@@ -1067,8 +1164,32 @@ function toManualGuideOverride(manualCentering: ManualCenteringView | null | und
   return {
     sourceSize: { w: sourceSize.w, h: sourceSize.h },
     cardRect: { x: cardRect.x, y: cardRect.y, w: cardRect.w, h: cardRect.h },
-    innerRect: { x: innerRect.x, y: innerRect.y, w: innerRect.w, h: innerRect.h }
+    innerRect: { x: innerRect.x, y: innerRect.y, w: innerRect.w, h: innerRect.h },
+    normalization: manualNormalization ?? null,
+    surfaceFinishMode
   };
+}
+
+function readManualNormalizationFromResult(result: GradeResult | null | undefined): ManualImageNormalization | null {
+  const manualGuideOverride = (result?.debug as Record<string, unknown> | undefined)?.manualGuideOverride as Record<string, unknown> | undefined;
+  const normalization = manualGuideOverride?.normalization as Record<string, unknown> | undefined;
+  if (!normalization) return null;
+
+  const rotationDeg = typeof normalization.rotationDeg === 'number' ? normalization.rotationDeg : 0;
+  const skewXDeg = typeof normalization.skewXDeg === 'number' ? normalization.skewXDeg : 0;
+  const skewYDeg = typeof normalization.skewYDeg === 'number' ? normalization.skewYDeg : 0;
+  const anchorValue = normalization.anchor as Record<string, unknown> | undefined;
+  const anchor = anchorValue && typeof anchorValue.x === 'number' && typeof anchorValue.y === 'number'
+    ? { x: anchorValue.x, y: anchorValue.y }
+    : null;
+  const source = normalization.source === 'auto' ? 'auto' : 'manual';
+  const confidence = typeof normalization.confidence === 'number' ? normalization.confidence : null;
+  return { rotationDeg, skewXDeg, skewYDeg, anchor, source, confidence };
+}
+
+function readSurfaceFinishModeFromResult(result: GradeResult | null | undefined): SurfaceFinishMode {
+  const manualGuideOverride = (result?.debug as Record<string, unknown> | undefined)?.manualGuideOverride as Record<string, unknown> | undefined;
+  return manualGuideOverride?.surfaceFinishMode === 'textured' ? 'textured' : 'standard';
 }
 
 function revokeObjectUrlSafe(url?: string): void {
@@ -1094,6 +1215,8 @@ function EstimateEvidenceModal({
   const mm = deriveCenteringMillimeters(centering);
   const report = result.report;
   const flaws = result.flaws;
+  const manualNormalization = readManualNormalizationFromResult(result);
+  const surfaceFinishMode = readSurfaceFinishModeFromResult(result);
   const [isRawReportOpen, setIsRawReportOpen] = useState(false);
   const [isRawDebugOpen, setIsRawDebugOpen] = useState(false);
   const overlaySrc = payload.overlayObjectURL ?? payload.rectifiedObjectURL ?? payload.sourceObjectURL;
@@ -1170,6 +1293,15 @@ function EstimateEvidenceModal({
             <div className="kv"><div className="small">Estimated mm (T/B)</div><div>{mm ? `${mm.top.toFixed(2)}mm / ${mm.bottom.toFixed(2)}mm` : '-'}</div></div>
             <div className="kv"><div className="small">Card rect (x,y,w,h)</div><div>{centering ? `${centering.debug.cardRect.x}, ${centering.debug.cardRect.y}, ${centering.debug.cardRect.w}, ${centering.debug.cardRect.h}` : '-'}</div></div>
             <div className="kv"><div className="small">Inner rect (x,y,w,h)</div><div>{centering ? `${centering.debug.innerRect.x}, ${centering.debug.innerRect.y}, ${centering.debug.innerRect.w}, ${centering.debug.innerRect.h}` : '-'}</div></div>
+            <div className="kv">
+              <div className="small">Straighten transform</div>
+              <div>
+                {manualNormalization && !isIdentityNormalization(manualNormalization)
+                  ? `Rotate ${manualNormalization.rotationDeg.toFixed(1)}°, Skew X ${manualNormalization.skewXDeg.toFixed(1)}°, Skew Y ${manualNormalization.skewYDeg.toFixed(1)}°`
+                  : 'None'}
+              </div>
+            </div>
+            <div className="kv"><div className="small">Surface mode</div><div>{surfaceFinishMode === 'textured' ? 'Textured / holographic / embossed' : 'Standard'}</div></div>
           </section>
 
           <section className="resultModalSection">
@@ -1277,6 +1409,40 @@ function sameCentering(
     && Math.round(baseCentering.debug.innerRect.w) === Math.round(manualCentering.debug.innerRect.w)
     && Math.round(baseCentering.debug.innerRect.h) === Math.round(manualCentering.debug.innerRect.h)
   );
+}
+
+function sameNormalization(
+  baseNormalization: ManualImageNormalization | null | undefined,
+  manualNormalization: ManualImageNormalization | null | undefined
+): boolean {
+  const left = baseNormalization ?? null;
+  const right = manualNormalization ?? null;
+  const leftIdentity = !left || isIdentityNormalization(left);
+  const rightIdentity = !right || isIdentityNormalization(right);
+  if (leftIdentity && rightIdentity) return true;
+  if (!left || !right) return false;
+
+  const leftAnchor = left.anchor ?? null;
+  const rightAnchor = right.anchor ?? null;
+  return (
+    Math.abs(left.rotationDeg - right.rotationDeg) < 0.001
+    && Math.abs(left.skewXDeg - right.skewXDeg) < 0.001
+    && Math.abs(left.skewYDeg - right.skewYDeg) < 0.001
+    && ((leftAnchor == null && rightAnchor == null)
+      || (
+        leftAnchor != null
+        && rightAnchor != null
+        && Math.abs(leftAnchor.x - rightAnchor.x) < 0.5
+        && Math.abs(leftAnchor.y - rightAnchor.y) < 0.5
+      ))
+  );
+}
+
+function sameSurfaceFinishMode(
+  left: SurfaceFinishMode | null | undefined,
+  right: SurfaceFinishMode | null | undefined
+): boolean {
+  return (left ?? 'standard') === (right ?? 'standard');
 }
 
 function deriveCenteringMillimeters(centering: ManualCenteringView | GradeResult['centering'] | null) {
