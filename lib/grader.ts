@@ -118,6 +118,7 @@ export type QualityAssessment = {
   stdLuma: number;
   resolution: { width: number; height: number; longEdgePx: number };
   cardDetected: boolean;
+  cardTouchesFrame: boolean;
   fullFrontVisible: boolean;
   checks: QualityCheck[];
 };
@@ -266,39 +267,11 @@ export const TUNING = {
   edgewearMinorCm: 8,
   edgewearModerateCm: 16,
 
-  // Indentation thresholds: using area in mm^2 from table
-  indentationSlightMm2: 4,
-  indentationModerateMm2: 25,
-
-  // Grime thresholds: 2.5mm^2 slight, then cm^2
-  grimeSlightMm2: 2.5,
-  grimeMinorCm2: 13.75,
-  grimeModerateCm2: 27.5,
-
-  // Bend/crease length thresholds (cm)
-  bendMinorCm: 1,
-  bendModerateCm: 2,
-  bendMajorCm: 2.0001,
-
   // Surface wear & fault thresholds (cm^2)
   surfaceWearSlightCm2: 0.25,
   surfaceWearMinorCm2: 1,
   surfaceWearModerateCm2: 4,
-  surfaceWearMajorCm2: 16,
-
-  // Defect thresholds (cm^2)
-  defectSlightCm2: 0.25,
-  defectMinorCm2: 0.5,
-  defectModerateCm2: 1,
-
-  // Corner rounding heuristic thresholds (radius in px on rectified image)
-  // Modern cards, especially Yu-Gi-Oh, often have visibly rounded factory corners.
-  // Treat a baseline radius as normal before escalating to a flaw.
-  cornerNaturalRadiusAllowancePx: 8,
-  cornerRadiusSlightPx: 5,
-  cornerRadiusMinorPx: 10,
-  cornerRadiusModeratePx: 18,
-  cornerRadiusMajorPx: 28
+  surfaceWearMajorCm2: 16
 };
 
 let cvPromise: Promise<any> | null = null;
@@ -355,89 +328,208 @@ export async function gradeCardFrontCanvasOnly(
 async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; overlayPNG: string; rectifiedPNG: string }> {
   const cv = await getCV();
   const img = await fileToMat(cv, file);
+  let rectified: any | null = null;
+  let overlay: any | null = null;
 
-  // Quality gates on original (before rectification)
-  const reasons: UnscorableReason[] = [];
-  const blurVar = laplacianVariance(cv, img);
-  if (blurVar < TUNING.blurVarianceThreshold) {
-    reasons.push({ code: 'BLURRY', message: `Image is blurry (Laplacian variance ${blurVar.toFixed(1)} < ${TUNING.blurVarianceThreshold}).` });
-  }
-  const glare = estimateGlare(cv, img);
-  if (glare.frac > TUNING.glareMaxFrac) {
-    reasons.push({ code: 'GLARE', message: `Glare detected (bright-saturated pixels ${(glare.frac * 100).toFixed(1)}% > ${(TUNING.glareMaxFrac * 100).toFixed(1)}%).` });
-  }
+  try {
+    const blurVar = laplacianVariance(cv, img);
+    const glare = estimateGlare(cv, img);
+    const quad = detectCardQuadrilateral(cv, img);
+    if (!quad) {
+      const result: GradeResult = {
+        final: {
+          unscorable: true,
+          unscorableReasons: [{ code: 'CARD_NOT_FOUND', message: 'Could not find a 4-corner card contour.' }],
+          gradeLabel: 'UNSCORABLE',
+          psaNumeric: 0,
+          confidence: 0.1
+        }
+      };
+      const rectifiedPNG = await matToDataUrl(cv, img);
+      return { result, overlayPNG: rectifiedPNG, rectifiedPNG };
+    }
 
-  // Detect card quadrilateral
-  const quad = detectCardQuadrilateral(cv, img);
-  if (!quad) {
+    const rectifiedResult = rectifyCard(cv, img, quad);
+    rectified = rectifiedResult.rectified;
+    const { skewAngleDeg } = rectifiedResult;
+
+    const rectifiedImageData = matToImageDataRGBA(cv, rectified);
+    const rectifiedPx = rectifiedImageData.data;
+    const rectifiedWidth = rectifiedImageData.width;
+    const rectifiedHeight = rectifiedImageData.height;
+    const rectifiedCardBounds: ContentBounds = {
+      minX: 0,
+      minY: 0,
+      maxX: rectifiedWidth - 1,
+      maxY: rectifiedHeight - 1
+    };
+
+    const rectifiedBorderColor = estimateBorderColor(rectifiedPx, rectifiedWidth, rectifiedHeight);
+    const rectifiedColorBounds = estimateContentBounds(rectifiedPx, rectifiedWidth, rectifiedHeight, rectifiedBorderColor);
+    const rectifiedProfileBounds = detectOuterCardBounds(rectifiedPx, rectifiedWidth, rectifiedHeight);
+    const rectifiedThresholdBounds = detectOuterCardBoundsByAdaptiveThreshold(
+      rectifiedPx,
+      rectifiedWidth,
+      rectifiedHeight,
+      rectifiedBorderColor
+    );
+    const rectifiedDetectedBounds = chooseBestCardBounds(
+      rectifiedColorBounds,
+      rectifiedProfileBounds,
+      rectifiedWidth,
+      rectifiedHeight,
+      rectifiedThresholdBounds,
+      inferFullFrameCardBounds(rectifiedWidth, rectifiedHeight)
+    );
+
+    let innerBounds = detectInnerContentBounds(rectifiedPx, rectifiedWidth, rectifiedHeight, rectifiedCardBounds);
+    let centering = innerBounds
+      ? buildCanvasCentering(rectifiedCardBounds, innerBounds, rectifiedWidth, rectifiedHeight)
+      : undefined;
+    if (!centering) {
+      const cvCentering = computeCentering(cv, rectified);
+      if (cvCentering) {
+        centering = cvCentering;
+        innerBounds = rectToContentBounds(cvCentering.debug.innerRect, rectifiedWidth, rectifiedHeight);
+      }
+    }
+
+    const sourceImageData = matToImageDataRGBA(cv, img);
+    const sourceCardBounds = quadToBounds(quad, sourceImageData.width, sourceImageData.height);
+    const sourceStats = computeLumaStats(
+      sourceImageData.data,
+      sourceImageData.width,
+      sourceImageData.height,
+      sourceCardBounds
+    );
+    const borderConfidence = assessNormalizedBorderConfidence({
+      normalizationMethod: 'opencv_perspective',
+      width: rectifiedWidth,
+      height: rectifiedHeight,
+      expectedBounds: rectifiedCardBounds,
+      detectedBounds: rectifiedCardBounds
+    });
+    const qualityAssessment = buildCanvasQualityAssessment({
+      stats: sourceStats,
+      sourceWidth: sourceImageData.width,
+      sourceHeight: sourceImageData.height,
+      cardBounds: sourceCardBounds,
+      innerBounds,
+      borderConfidence
+    });
+    const confidenceCeiling = observabilityCeilingFromQuality(qualityAssessment);
+    const unscorableReasons = buildCanvasUnscorableReasons(qualityAssessment, innerBounds);
+    if (Math.abs(skewAngleDeg) > TUNING.maxSkewAngleDeg) {
+      unscorableReasons.push({ code: 'EXTREME_SKEW', message: `Perspective skew too extreme (≈${skewAngleDeg.toFixed(1)}°).` });
+    }
+    if (glare.frac > TUNING.glareMaxFrac && !unscorableReasons.some((reason) => reason.code === 'GLARE')) {
+      unscorableReasons.push({ code: 'GLARE', message: `Glare detected (bright-saturated pixels ${(glare.frac * 100).toFixed(1)}% > ${(TUNING.glareMaxFrac * 100).toFixed(1)}%).` });
+    }
+
+    const flawRes = detectCanvasPsaStyleFlaws(
+      rectifiedPx,
+      rectifiedWidth,
+      rectifiedHeight,
+      rectifiedCardBounds,
+      innerBounds,
+      'standard'
+    );
+    const centeringCap = centering?.gradeCap ?? { gradeLabel: 'PR 1', psaNumeric: 1 };
+    const centeringAndFlawCap = finalGradeFromCaps(centeringCap, flawRes.gradeCap);
+    const finalCap = finalGradeFromCaps(centeringAndFlawCap, confidenceCeiling.cap);
+    const confidence = clamp01((computeCanvasConfidence(
+      flawRes.debug.blurVariance,
+      flawRes.debug.meanLuma,
+      flawRes.debug.stdLuma,
+      !!innerBounds
+    ) * 0.55) + (qualityAssessment.imageQualityScore * 0.45));
+    const unscorable = unscorableReasons.length > 0;
+    const gradedLabel = unscorable ? 'UNSCORABLE' : finalCap.gradeLabel;
+    const gradedNumeric = unscorable ? 0 : finalCap.psaNumeric;
+
     const result: GradeResult = {
+      centering,
+      flaws: flawRes,
       final: {
-        unscorable: true,
-        unscorableReasons: [{ code: 'CARD_NOT_FOUND', message: 'Could not find a 4-corner card contour.' }],
-        gradeLabel: 'UNSCORABLE',
-        psaNumeric: 0,
-        confidence: 0.1
+        unscorable,
+        unscorableReasons: unscorable ? unscorableReasons : undefined,
+        gradeLabel: gradedLabel,
+        psaNumeric: gradedNumeric,
+        confidence
+      },
+      report: buildStructuredGradeReport({
+        imageName: file.name,
+        quality: qualityAssessment,
+        centering,
+        flaws: flawRes,
+        confidenceCeiling,
+        finalGradeLabel: gradedLabel,
+        finalGradeNumeric: gradedNumeric,
+        confidence,
+        assumptions: [
+          'Front image only.',
+          'OpenCV quadrilateral detection rectified the card before centering and visible-defect analysis.',
+          'Visible defect thresholds are heuristic proxies derived from the supplied rubric.'
+        ],
+        limitations: [
+          'This is a conservative automated pre-grade, not an official grading outcome.',
+          'OpenCV rectification depends on a clean four-corner contour.',
+          ...(unscorable ? ['One or more required front-image grading prerequisites were not met.'] : [])
+        ]
+      }),
+      debug: {
+        opencvPath: true,
+        blurVar,
+        glare,
+        skewAngleDeg,
+        quad,
+        sourceCardBounds,
+        rectifiedColorBounds,
+        rectifiedProfileBounds,
+        rectifiedThresholdBounds,
+        rectifiedDetectedBounds,
+        rectifiedCardBounds,
+        innerBounds,
+        qualityAssessment,
+        confidenceCeiling,
+        unscorableReasons,
+        psaStyle: {
+          centering: centering
+            ? {
+              lr: centering.lr.ratio,
+              tb: centering.tb.ratio,
+              centeringCap: centering.gradeCap
+            }
+            : {
+              unavailable: true,
+              reason: 'Inner border-to-art transition was not detected reliably for scoring.'
+            },
+          flawItems: flawRes.items.map((item) => ({
+            category: item.category,
+            severity: item.severity,
+            points: item.points,
+            metric: item.metric
+          })),
+          flawDebug: flawRes.debug,
+          finalCaps: {
+            centering: centeringCap,
+            visibleDefect: flawRes.gradeCap,
+            confidence: confidenceCeiling.cap,
+            final: finalCap
+          }
+        }
       }
     };
-    // Minimal overlay = show original
-    const rectifiedPNG = await matToDataUrl(cv, img);
-    const overlayPNG = rectifiedPNG;
-    img.delete();
+
+    overlay = drawOverlay(cv, rectified, centering ?? null, flawRes);
+    const rectifiedPNG = await matToDataUrl(cv, rectified);
+    const overlayPNG = await matToDataUrl(cv, overlay);
     return { result, overlayPNG, rectifiedPNG };
+  } finally {
+    if (overlay) overlay.delete();
+    if (rectified) rectified.delete();
+    img.delete();
   }
-
-  // Rectify
-  const { rectified, skewAngleDeg } = rectifyCard(cv, img, quad);
-  if (Math.abs(skewAngleDeg) > TUNING.maxSkewAngleDeg) {
-    reasons.push({ code: 'EXTREME_SKEW', message: `Perspective skew too extreme (≈${skewAngleDeg.toFixed(1)}°).` });
-  }
-
-  // Compute centering (front only)
-  const centering = computeCentering(cv, rectified);
-  if (!centering) {
-    reasons.push({ code: 'BORDER_NOT_DETECTABLE', message: 'Could not reliably detect the inner content boundary to measure borders.' });
-  }
-
-  // Flaw detection on rectified
-  const flawRes = detectFlaws(cv, rectified);
-
-  // Combine caps
-  const centeringCap = centering?.gradeCap ?? { gradeLabel: 'PR 1', psaNumeric: 1 };
-  const flawCap = flawRes.gradeCap;
-  const finalCap = finalGradeFromCaps(centeringCap, flawCap);
-
-  const unscorable = reasons.length > 0 || !centering;
-  const confidence = computeConfidence({ blurVar, glareFrac: glare.frac, skewAngleDeg, centeringOk: !!centering, reasonsCount: reasons.length });
-
-  const result: GradeResult = {
-    centering: centering ?? undefined,
-    flaws: flawRes,
-    final: {
-      unscorable,
-      unscorableReasons: unscorable ? reasons : undefined,
-      gradeLabel: unscorable ? 'UNSCORABLE' : finalCap.gradeLabel,
-      psaNumeric: unscorable ? 0 : finalCap.psaNumeric,
-      confidence
-    },
-    debug: {
-      blurVar,
-      glare,
-      skewAngleDeg,
-      quad
-    }
-  };
-
-  // Overlays
-  const overlay = drawOverlay(cv, rectified, centering, flawRes);
-
-  const rectifiedPNG = await matToDataUrl(cv, rectified);
-  const overlayPNG = await matToDataUrl(cv, overlay);
-
-  img.delete();
-  rectified.delete();
-  overlay.delete();
-
-  return { result, overlayPNG, rectifiedPNG };
 }
 
 async function analyzeCardFrontCanvasFallback(
@@ -472,7 +564,8 @@ async function analyzeCardFrontCanvasFallback(
   const colorBounds = estimateContentBounds(sourcePx, width, height, borderColor);
   const profileBounds = detectOuterCardBounds(sourcePx, width, height);
   const thresholdBounds = detectOuterCardBoundsByAdaptiveThreshold(sourcePx, width, height, borderColor);
-  const autoCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height, thresholdBounds);
+  const fullFrameBounds = inferFullFrameCardBounds(width, height);
+  const autoCardBounds = chooseBestCardBounds(colorBounds, profileBounds, width, height, thresholdBounds, fullFrameBounds);
   const cardBounds = manualGuideBounds?.cardBounds ?? autoCardBounds;
   const sourceCardBounds = cardBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
   const paddedSourceCardBounds = manualGuideBounds
@@ -597,7 +690,7 @@ async function analyzeCardFrontCanvasFallback(
     : autoInnerBounds;
   const centeringPreview = buildCanvasCentering(normalizedCardBounds, innerBounds, normalizedWidth, normalizedHeight);
   const centering = innerBounds ? centeringPreview : undefined;
-  const sourceStats = computeLumaStats(sourcePx, width, height);
+  const sourceStats = computeLumaStats(sourcePx, width, height, cardBounds);
   const qualityAssessment = buildCanvasQualityAssessment({
     stats: sourceStats,
     sourceWidth: width,
@@ -621,6 +714,7 @@ async function analyzeCardFrontCanvasFallback(
     colorBounds,
     profileBounds,
     thresholdBounds,
+    fullFrameBounds,
     normalizedColorBounds,
     normalizedProfileBounds,
     normalizedThresholdBounds,
@@ -1432,37 +1526,32 @@ function matToImageDataRGBA(cv: any, mat: any): ImageData {
 }
 
 function estimateBorderColor(px: Uint8ClampedArray, width: number, height: number): { r: number; g: number; b: number } {
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  let count = 0;
+  const rValues: number[] = [];
+  const gValues: number[] = [];
+  const bValues: number[] = [];
   const step = Math.max(2, Math.floor(Math.min(width, height) / 240));
 
   for (let x = 0; x < width; x += step) {
     const top = (x * 4);
     const bottom = ((height - 1) * width + x) * 4;
-    r += px[top];
-    g += px[top + 1];
-    b += px[top + 2];
-    r += px[bottom];
-    g += px[bottom + 1];
-    b += px[bottom + 2];
-    count += 2;
+    rValues.push(px[top], px[bottom]);
+    gValues.push(px[top + 1], px[bottom + 1]);
+    bValues.push(px[top + 2], px[bottom + 2]);
   }
   for (let y = 0; y < height; y += step) {
     const left = (y * width) * 4;
     const right = (y * width + (width - 1)) * 4;
-    r += px[left];
-    g += px[left + 1];
-    b += px[left + 2];
-    r += px[right];
-    g += px[right + 1];
-    b += px[right + 2];
-    count += 2;
+    rValues.push(px[left], px[right]);
+    gValues.push(px[left + 1], px[right + 1]);
+    bValues.push(px[left + 2], px[right + 2]);
   }
 
-  if (count === 0) return { r: 127, g: 127, b: 127 };
-  return { r: r / count, g: g / count, b: b / count };
+  if (rValues.length === 0) return { r: 127, g: 127, b: 127 };
+  return {
+    r: percentile(rValues.sort((a, b) => a - b), 0.5),
+    g: percentile(gValues.sort((a, b) => a - b), 0.5),
+    b: percentile(bValues.sort((a, b) => a - b), 0.5)
+  };
 }
 
 function estimateContentBounds(
@@ -1580,23 +1669,28 @@ function detectOuterCardBoundsByAdaptiveThreshold(
   const borderLuma = (border.r * 0.299) + (border.g * 0.587) + (border.b * 0.114);
   const adaptiveDelta = Math.max(14, Math.min(72, Math.abs(otsuThreshold - borderLuma) * 0.72 + 10));
 
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
+  const colHits = new Array<number>(width).fill(0);
+  const rowHits = new Array<number>(height).fill(0);
   for (let y = 0; y < height; y += sampleStep) {
     for (let x = 0; x < width; x += sampleStep) {
       const index = (y * width + x) * 4;
       const luma = (px[index] * 0.299) + (px[index + 1] * 0.587) + (px[index + 2] * 0.114);
       if (Math.abs(luma - borderLuma) >= adaptiveDelta) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
+        colHits[x]++;
+        rowHits[y]++;
       }
     }
   }
 
+  const sampledRows = Math.max(1, Math.ceil(height / sampleStep));
+  const sampledCols = Math.max(1, Math.ceil(width / sampleStep));
+  const minColSupport = Math.max(2, Math.round(sampledRows * 0.018));
+  const minRowSupport = Math.max(2, Math.round(sampledCols * 0.018));
+  const minX = findSupportedProfileIndex(colHits, minColSupport, 'first');
+  const maxX = findSupportedProfileIndex(colHits, minColSupport, 'last');
+  const minY = findSupportedProfileIndex(rowHits, minRowSupport, 'first');
+  const maxY = findSupportedProfileIndex(rowHits, minRowSupport, 'last');
+  if (minX == null || maxX == null || minY == null || maxY == null) return null;
   if (maxX < minX || maxY < minY) return null;
   const expanded = {
     minX: clampInt(minX - sampleStep, 0, width - 1),
@@ -1609,6 +1703,24 @@ function detectOuterCardBoundsByAdaptiveThreshold(
   const areaFrac = (candidateWidth * candidateHeight) / Math.max(1, width * height);
   if (areaFrac < 0.22 || areaFrac > 0.99) return null;
   return expanded;
+}
+
+function findSupportedProfileIndex(
+  profile: number[],
+  minSupport: number,
+  mode: 'first' | 'last'
+): number | null {
+  if (mode === 'first') {
+    for (let index = 0; index < profile.length; index++) {
+      if (profile[index] >= minSupport) return index;
+    }
+    return null;
+  }
+
+  for (let index = profile.length - 1; index >= 0; index--) {
+    if (profile[index] >= minSupport) return index;
+  }
+  return null;
 }
 
 function otsuFromHistogram(histogram: number[], sampleCount: number): number {
@@ -1647,7 +1759,8 @@ export function chooseBestCardBounds(
   profileBounds: ContentBounds | null,
   width: number,
   height: number,
-  thresholdBounds?: ContentBounds | null
+  thresholdBounds?: ContentBounds | null,
+  fullFrameBounds?: ContentBounds | null
 ): ContentBounds | null {
   let baseChoice: ContentBounds | null = null;
   const pairCandidates = [colorBounds, profileBounds].filter((x): x is ContentBounds => !!x);
@@ -1679,8 +1792,16 @@ export function chooseBestCardBounds(
     }
   }
 
-  if (!thresholdBounds) return baseChoice;
-  if (!baseChoice) return thresholdBounds;
+  if (!thresholdBounds) {
+    return !baseChoice || !isFinite(scoreCardBounds(baseChoice, width, height))
+      ? fullFrameBounds ?? baseChoice
+      : baseChoice;
+  }
+  if (!baseChoice) {
+    return isFinite(scoreCardBounds(thresholdBounds, width, height))
+      ? thresholdBounds
+      : fullFrameBounds ?? thresholdBounds;
+  }
 
   const tolerance = Math.max(4, Math.round(Math.min(width, height) * 0.01));
   const baseContainsThreshold = boundsContain(baseChoice, thresholdBounds, tolerance);
@@ -1700,7 +1821,11 @@ export function chooseBestCardBounds(
   ) {
     return merged;
   }
-  if (!isFinite(baseScore)) return thresholdBounds;
+  if (!isFinite(baseScore)) {
+    return isFinite(thresholdScore)
+      ? thresholdBounds
+      : fullFrameBounds ?? thresholdBounds;
+  }
   if (!isFinite(thresholdScore)) return baseChoice;
   return thresholdScore > baseScore ? thresholdBounds : baseChoice;
 }
@@ -1709,17 +1834,23 @@ function scoreCardBounds(bounds: ContentBounds, width: number, height: number): 
   const w = Math.max(1, bounds.maxX - bounds.minX + 1);
   const h = Math.max(1, bounds.maxY - bounds.minY + 1);
   const areaFrac = (w * h) / Math.max(1, width * height);
-  if (areaFrac < 0.2 || areaFrac > 0.99) return Number.NEGATIVE_INFINITY;
+  if (areaFrac < 0.16 || areaFrac > 1.01) return Number.NEGATIVE_INFINITY;
 
   const targetAspect = TUNING.cardWidthCm / TUNING.cardHeightCm;
   const aspect = w / h;
-  const aspectScore = 1 - Math.min(1, Math.abs(Math.log(aspect / targetAspect)));
-  const areaScore = 1 - Math.min(1, Math.abs(areaFrac - 0.68) / 0.68);
-  const edgePenalty =
+  const aspectError = Math.abs(Math.log(aspect / targetAspect));
+  const aspectScore = 1 - Math.min(1, aspectError);
+  const areaScore = areaFrac >= 0.55
+    ? 1 - Math.min(0.28, Math.abs(areaFrac - 0.72) * 0.55)
+    : Math.max(0, areaFrac / 0.55);
+  const rawEdgePenalty =
     (bounds.minX <= 0 ? 0.08 : 0) +
     (bounds.minY <= 0 ? 0.08 : 0) +
     (bounds.maxX >= width - 1 ? 0.08 : 0) +
     (bounds.maxY >= height - 1 ? 0.08 : 0);
+  const edgePenalty = areaFrac >= 0.96 && aspectError <= 0.08
+    ? rawEdgePenalty * 0.35
+    : rawEdgePenalty;
   return (aspectScore * 0.65) + (areaScore * 0.35) - edgePenalty;
 }
 
@@ -1739,6 +1870,27 @@ function mergeBounds(a: ContentBounds, b: ContentBounds, width: number, height: 
     maxX: clampInt(Math.max(a.maxX, b.maxX), 0, Math.max(0, width - 1)),
     maxY: clampInt(Math.max(a.maxY, b.maxY), 0, Math.max(0, height - 1))
   };
+}
+
+function inferFullFrameCardBounds(width: number, height: number): ContentBounds | null {
+  if (width < 64 || height < 64) return null;
+  const targetAspect = TUNING.cardWidthCm / TUNING.cardHeightCm;
+  const aspect = width / height;
+  const aspectError = Math.abs(Math.log(aspect / targetAspect));
+  if (aspectError > 0.08) return null;
+  return { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
+}
+
+function rectToContentBounds(
+  rect: { x: number; y: number; w: number; h: number },
+  width: number,
+  height: number
+): ContentBounds {
+  const minX = clampInt(rect.x, 0, Math.max(0, width - 2));
+  const minY = clampInt(rect.y, 0, Math.max(0, height - 2));
+  const maxX = clampInt(rect.x + rect.w - 1, minX + 1, Math.max(1, width - 1));
+  const maxY = clampInt(rect.y + rect.h - 1, minY + 1, Math.max(1, height - 1));
+  return { minX, minY, maxX, maxY };
 }
 
 function overlapFraction(a: ContentBounds, b: ContentBounds): number {
@@ -2814,6 +2966,8 @@ export function detectCanvasPsaStyleFlaws(
     edgeWearOutlierPct: number;
     cornerWearScore: number;
     cornerWearOutlierPct: number;
+    broadPerimeterWearScore: number;
+    broadPerimeterWearSeverity: Severity;
     interiorAnomalyPerK: number;
     interiorStrongPerK: number;
     interiorLinearPerK: number;
@@ -3157,7 +3311,8 @@ export function detectCanvasPsaStyleFlaws(
 
   // Surface wear proxy based on border cleanliness and tonal spread on the detected card.
   const surfaceWearScoreSeverity: Severity =
-    borderCleanlinessScore > 54 ? 'Moderate'
+    borderCleanlinessScore > 72 ? 'Major'
+      : borderCleanlinessScore > 54 ? 'Moderate'
       : borderCleanlinessScore > 36 ? 'Minor'
         : borderCleanlinessScore > 24 ? 'Slight'
           : 'NONE';
@@ -3185,7 +3340,8 @@ export function detectCanvasPsaStyleFlaws(
 
   // Avoid double-counting a single localized edge issue as both edge wear and broad surface wear.
   const edgewearScoreSeverity: Severity =
-    edgeWearScore > 44 ? 'Moderate'
+    edgeWearScore > 58 ? 'Major'
+      : edgeWearScore > 44 ? 'Moderate'
       : edgeWearScore > 30 ? 'Minor'
         : edgeWearScore > 20 ? 'Slight'
           : 'NONE';
@@ -3221,6 +3377,40 @@ export function detectCanvasPsaStyleFlaws(
   ) {
     surfaceWearSeverity = 'NONE';
   }
+
+  const broadPerimeterWearScore = Math.max(
+    0,
+    Math.max(0, borderSideCount - 1) * 8
+      + Math.min(26, borderHotspotCoveragePct * 2.6)
+      + Math.min(24, edgeHotspotCoveragePct * 1.1)
+      + Math.min(22, cornerHotspots.length * 5.5)
+      + clamp01((borderCleanlinessScore - 28) / 42) * 18
+      + clamp01((edgeWearScore - 20) / 38) * 14
+      + clamp01((cornerWearScore - 14) / 36) * 12
+      - finishProfile.borderTextureConfidence * 12
+  );
+  const broadPerimeterWearIsMajor =
+    (broadPerimeterWearScore >= 70 && borderSideCount >= 3 && cornerHotspots.length >= 2)
+    || (broadPerimeterWearScore >= 64 && borderSideCount >= 4 && cornerHotspots.length >= 3)
+    || (edgeHotspotCoveragePct >= 30 && borderSideCount >= 3 && cornerHotspots.length >= 3);
+  const broadPerimeterWearIsModerate =
+    broadPerimeterWearIsMajor
+    || (broadPerimeterWearScore >= 48 && borderSideCount >= 3 && cornerHotspots.length >= 1)
+    || (broadPerimeterWearScore >= 55 && borderSideCount >= 2 && cornerHotspots.length >= 2);
+  const broadPerimeterWearSeverity: Severity = broadPerimeterWearIsMajor
+    ? 'Major'
+    : broadPerimeterWearIsModerate ? 'Moderate' : 'NONE';
+  if (broadPerimeterWearSeverity === 'Major') {
+    edgewearSeverity = worseSeverity(edgewearSeverity, 'Major');
+    surfaceWearSeverity = worseSeverity(surfaceWearSeverity, 'Moderate');
+  } else if (broadPerimeterWearSeverity === 'Moderate') {
+    edgewearSeverity = worseSeverity(edgewearSeverity, 'Moderate');
+    surfaceWearSeverity = worseSeverity(surfaceWearSeverity, 'Moderate');
+  }
+  const broadCornerMinimum: Severity = broadPerimeterWearSeverity === 'Major'
+    ? 'Moderate'
+    : broadPerimeterWearSeverity === 'Moderate' && cornerHotspots.length >= 2 ? 'Moderate' : 'NONE';
+
   if (surfaceWearSeverity !== 'NONE') {
     const hotspot = borderHotspots[0];
     const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
@@ -3284,26 +3474,61 @@ export function detectCanvasPsaStyleFlaws(
     addFlawItem('Edgewear', edgewearSeverity, finding.metric, finding);
   }
 
+  if (broadPerimeterWearSeverity === 'Major') {
+    const aggregateDefectSeverity: Exclude<Severity, 'NONE'> =
+      broadPerimeterWearScore >= 88
+      && cornerHotspots.length >= 4
+      && edgeHotspotCoveragePct >= 32
+        ? 'Major'
+        : 'Moderate';
+    const finding = createObservedFinding({
+      category: 'shape',
+      flawType: 'overall perimeter damage',
+      severity: severityToFindingSeverity(aggregateDefectSeverity),
+      metric: `Overall perimeter wear index ${broadPerimeterWearScore.toFixed(1)} (${borderSideCount} affected edge${borderSideCount === 1 ? '' : 's'}, ${cornerHotspots.length} affected corner${cornerHotspots.length === 1 ? '' : 's'}, edge coverage ${edgeHotspotCoveragePct.toFixed(1)}%)`,
+      location: describeAffectedSides(borderSides),
+      notes: [
+        'Broad perimeter damage is scored as an aggregate defect so heavy edge, corner, and border wear cannot be diluted into a PSA 6-style result.',
+        'The aggregate only activates when wear spans multiple edges and is supported by corner or coverage evidence.'
+      ],
+      measurement: {
+        kind: 'index',
+        value: broadPerimeterWearScore,
+        display: `${broadPerimeterWearScore.toFixed(1)} wear index`,
+        approximate: true,
+        normalized: clamp01(broadPerimeterWearScore / 100)
+      },
+      evidenceStrength: 'high',
+      count: borderHotspots.length + cornerHotspots.length
+    });
+    addFlawItem('Defect', aggregateDefectSeverity, finding.metric, finding);
+  }
+
   const cornerScoreSeverity: Severity =
-    cornerWearScore > 38 ? 'Moderate'
+    cornerWearScore > 52 ? 'Major'
+      : cornerWearScore > 38 ? 'Moderate'
       : cornerWearScore > 26 ? 'Minor'
         : cornerWearScore > 15 ? 'Slight'
           : 'NONE';
   // Affected-corner count is used to stabilize low-confidence corner detections,
   // not to force severe grades by itself on naturally rounded/factory corners.
   const cornerMeasuredSeverity: Severity =
-    cornerHotspots.length >= 3 ? 'Minor'
+    cornerHotspots.length >= 4 ? 'Moderate'
+      : cornerHotspots.length >= 3 ? 'Minor'
       : cornerHotspots.length >= 1 ? 'Slight'
         : 'NONE';
   const cornerEvidenceStrength: EvidenceStrength =
     cornerHotspots.length >= 2 || cornerHotspots.some((hotspot) => hotspot.score >= 34)
       ? 'high'
       : cornerHotspots.length === 1 ? 'medium' : 'low';
-  const cornerWearSeverity = combineDetectedSeverity(
+  let cornerWearSeverity = combineDetectedSeverity(
     cornerScoreSeverity,
     cornerMeasuredSeverity,
     cornerEvidenceStrength
   );
+  if (broadCornerMinimum !== 'NONE') {
+    cornerWearSeverity = worseSeverity(cornerWearSeverity, broadCornerMinimum);
+  }
   if (cornerWearSeverity !== 'NONE') {
     const hotspot = cornerHotspots[0];
     const region = hotspot ? toFindingRegion(hotspot.bounds, width, height) : undefined;
@@ -3357,7 +3582,7 @@ export function detectCanvasPsaStyleFlaws(
   const cornerFindings = detectedFindings.filter((finding) => finding.category === 'corners');
   const edgeFindings = detectedFindings.filter((finding) => finding.category === 'edges');
   const surfaceFindings = detectedFindings.filter((finding) => finding.category === 'surface');
-  const shapeFindings: DetectedFinding[] = [];
+  const shapeFindings = detectedFindings.filter((finding) => finding.category === 'shape');
   const notReliablyObservable = [
     'indentation depth and show-through from the reverse',
     'true gloss loss',
@@ -3401,6 +3626,8 @@ export function detectCanvasPsaStyleFlaws(
       edgeWearOutlierPct: wearStats.edgeOutlierPct,
       cornerWearScore,
       cornerWearOutlierPct: wearStats.cornerOutlierPct,
+      broadPerimeterWearScore,
+      broadPerimeterWearSeverity,
       interiorAnomalyPerK: interiorStats.anomalyPerK,
       interiorStrongPerK: interiorStats.strongPerK,
       interiorLinearPerK: interiorStats.linearPerK,
@@ -4304,7 +4531,8 @@ function estimateBorderRoughness(
 function computeLumaStats(
   px: Uint8ClampedArray,
   width: number,
-  height: number
+  height: number,
+  bounds: ContentBounds | null = null
 ): {
   meanLuma: number;
   stdLuma: number;
@@ -4312,7 +4540,23 @@ function computeLumaStats(
   shadowClipFrac: number;
   highlightClipFrac: number;
 } {
-  const step = Math.max(1, Math.floor(Math.min(width, height) / 320));
+  const minAllowedX = 1;
+  const minAllowedY = 1;
+  const maxAllowedX = Math.max(minAllowedX, width - 2);
+  const maxAllowedY = Math.max(minAllowedY, height - 2);
+  const regionMinX = bounds ? clampInt(bounds.minX, minAllowedX, maxAllowedX) : minAllowedX;
+  const regionMinY = bounds ? clampInt(bounds.minY, minAllowedY, maxAllowedY) : minAllowedY;
+  const region = bounds
+    ? {
+      minX: regionMinX,
+      minY: regionMinY,
+      maxX: clampInt(bounds.maxX, regionMinX, maxAllowedX),
+      maxY: clampInt(bounds.maxY, regionMinY, maxAllowedY)
+    }
+    : { minX: minAllowedX, minY: minAllowedY, maxX: maxAllowedX, maxY: maxAllowedY };
+  const regionWidth = Math.max(1, region.maxX - region.minX + 1);
+  const regionHeight = Math.max(1, region.maxY - region.minY + 1);
+  const step = Math.max(1, Math.floor(Math.min(regionWidth, regionHeight) / 320));
   let count = 0;
   let sum = 0;
   let sumSq = 0;
@@ -4327,8 +4571,8 @@ function computeLumaStats(
     return px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114;
   };
 
-  for (let y = 1; y < height - 1; y += step) {
-    for (let x = 1; x < width - 1; x += step) {
+  for (let y = region.minY; y <= region.maxY; y += step) {
+    for (let x = region.minX; x <= region.maxX; x += step) {
       const c = lumaAt(x, y);
       sum += c;
       sumSq += c * c;
@@ -4390,7 +4634,8 @@ export function buildCanvasQualityAssessment(args: {
       || cardBounds.maxX >= sourceWidth - 3
       || cardBounds.maxY >= sourceHeight - 3;
   const borderReliabilityLow = borderConfidence.severity === 'high';
-  const fullFrontVisible = !!cardBounds && !cardTouchesFrame && !borderReliabilityLow;
+  const measurableTightCrop = cardTouchesFrame && !!innerBounds && !borderReliabilityLow;
+  const fullFrontVisible = !!cardBounds && !borderReliabilityLow && (!cardTouchesFrame || measurableTightCrop);
   const cardW = cardBounds ? Math.max(1, cardBounds.maxX - cardBounds.minX + 1) : 0;
   const cardH = cardBounds ? Math.max(1, cardBounds.maxY - cardBounds.minY + 1) : 0;
   const areaFrac = cardDetected ? (cardW * cardH) / Math.max(1, sourceWidth * sourceHeight) : 0;
@@ -4440,9 +4685,15 @@ export function buildCanvasQualityAssessment(args: {
       key: 'cropping',
       label: 'Cropping issues',
       observed: cardTouchesFrame,
-      severity: !cardDetected ? 'high' : cardTouchesFrame ? 'high' : 'none',
+      severity: !cardDetected
+        ? 'high'
+        : cardTouchesFrame
+          ? measurableTightCrop ? 'low' : innerBounds ? 'moderate' : 'high'
+          : 'none',
       metric: cardDetected ? `Bounds ${cardW}x${cardH}px` : undefined,
-      note: 'The full front should be visible to evaluate borders and perimeter wear conservatively.',
+      note: measurableTightCrop
+        ? 'The card is tightly framed, but the inner border is measurable; edge and corner wear still need conservative review.'
+        : 'The full front should be visible to evaluate borders and perimeter wear conservatively.',
       impactsObservability: true
     },
     {
@@ -4494,6 +4745,7 @@ export function buildCanvasQualityAssessment(args: {
     stdLuma: stats.stdLuma,
     resolution: { width: sourceWidth, height: sourceHeight, longEdgePx },
     cardDetected,
+    cardTouchesFrame,
     fullFrontVisible,
     checks
   };
@@ -5031,403 +5283,6 @@ function findProminentEdge(arr: number[], start: number, end: number, mode: 'lef
 }
 
 // =========================
-// Flaw detection (heuristics)
-// =========================
-function detectFlaws(cv: any, rectifiedRGBA: any): FlawResult {
-  const pxPerCmX = rectifiedRGBA.cols / TUNING.cardWidthCm;
-  const pxPerCmY = rectifiedRGBA.rows / TUNING.cardHeightCm;
-  const pxPerCm = (pxPerCmX + pxPerCmY) / 2;
-  const pxPerMm = pxPerCm / 10;
-
-  const items: FlawItem[] = [];
-
-  // 1) Scratches: detect thin long bright/dark lines using Canny + HoughLinesP
-  const scratch = detectScratches(cv, rectifiedRGBA, pxPerCm);
-  if (scratch) items.push(scratch);
-
-  // 2) Scuffing / surface wear: high-frequency texture anomalies in border + art combined
-  const scuff = detectScuffing(cv, rectifiedRGBA, pxPerCm);
-  if (scuff) items.push(scuff);
-
-  // 3) Edgewear: strong edge irregularities along perimeter
-  const edge = detectEdgewear(cv, rectifiedRGBA, pxPerCm);
-  if (edge) items.push(edge);
-
-  // 4) Indentation: blob-like small specular/dark patches; heuristic via LoG blobs
-  const indent = detectIndentation(cv, rectifiedRGBA, pxPerMm);
-  if (indent) items.push(indent);
-
-  // 5) Grime/stains: color outliers vs local neighborhood (LAB deltaE-ish)
-  const grime = detectGrime(cv, rectifiedRGBA, pxPerCm, pxPerMm);
-  if (grime) items.push(grime);
-
-  // 6) Bend/crease: long low-frequency line + gradient discontinuity
-  const bend = detectBends(cv, rectifiedRGBA, pxPerCm);
-  if (bend) items.push(bend);
-
-  // 7) Corner rounding: measure corner curvature radius
-  const corner = detectCornerRounding(cv, rectifiedRGBA);
-  if (corner) items.push(corner);
-
-  const assessed = assessConditionFromFlaws(items);
-
-  return {
-    totalPoints: assessed.totalPoints,
-    effectivePoints: assessed.effectivePoints,
-    condition: assessed.condition,
-    pointCondition: assessed.pointCondition,
-    matrixCondition: assessed.matrixCondition,
-    psaProfile: assessed.psaProfile,
-    limitingFlaws: assessed.limitingFlaws,
-    gradeCap: assessed.gradeCap,
-    items
-  };
-}
-
-function detectScratches(cv: any, rgba: any, pxPerCm: number): FlawItem | null {
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const edges = new cv.Mat();
-  cv.Canny(gray, edges, 40, 120);
-
-  const lines = new cv.Mat();
-  cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 80, 40, 8);
-
-  let totalLenPx = 0;
-  for (let i = 0; i < lines.rows; i++) {
-    const x1 = lines.data32S[i * 4 + 0];
-    const y1 = lines.data32S[i * 4 + 1];
-    const x2 = lines.data32S[i * 4 + 2];
-    const y2 = lines.data32S[i * 4 + 3];
-    const len = Math.hypot(x2 - x1, y2 - y1);
-    // Filter to mostly straight lines; ignore border edges by requiring interior placement
-    const midx = (x1 + x2) / 2;
-    const midy = (y1 + y2) / 2;
-    if (midx < 40 || midx > rgba.cols - 40 || midy < 40 || midy > rgba.rows - 40) continue;
-    if (len >= 25) totalLenPx += len;
-  }
-
-  const totalLenCm = totalLenPx / pxPerCm;
-  const sev = scratchSeverity(totalLenCm);
-
-  gray.delete();
-  edges.delete();
-  lines.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Scratch',
-    severity: sev,
-    points: severityToPoints(sev),
-    metric: `Sum length ≈ ${totalLenCm.toFixed(2)} cm`
-  };
-}
-
-function scratchSeverity(totalLenCm: number): Severity {
-  if (totalLenCm <= 0) return 'NONE';
-  if (totalLenCm <= TUNING.scratchMinLenCmSlight) return 'Slight';
-  if (totalLenCm <= TUNING.scratchMinLenCmMinor) return 'Minor';
-  if (totalLenCm > 4) return 'Moderate';
-  return 'Minor';
-}
-
-function detectScuffing(cv: any, rgba: any, pxPerCm: number): FlawItem | null {
-  // Heuristic: compare local variance map, threshold to blobs, measure area.
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const blur = new cv.Mat();
-  cv.GaussianBlur(gray, blur, new cv.Size(9, 9), 0);
-  const diff = new cv.Mat();
-  cv.absdiff(gray, blur, diff);
-  const thr = new cv.Mat();
-  cv.threshold(diff, thr, 18, 255, cv.THRESH_BINARY);
-
-  // remove thin lines (scratches) by opening
-  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
-  const opened = new cv.Mat();
-  cv.morphologyEx(thr, opened, cv.MORPH_OPEN, kernel);
-
-  const areaPx = cv.countNonZero(opened);
-  const areaCm2 = areaPx / (pxPerCm * pxPerCm);
-
-  const sev = areaToSeverity(areaCm2, {
-    slight: TUNING.scuffSlightCm2,
-    minor: TUNING.scuffMinorCm2,
-    moderate: TUNING.scuffModerateCm2,
-    major: TUNING.scuffMajorCm2
-  });
-
-  gray.delete();
-  blur.delete();
-  diff.delete();
-  thr.delete();
-  kernel.delete();
-  opened.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Scuffing',
-    severity: sev,
-    points: severityToPoints(sev),
-    metric: `Area ≈ ${areaCm2.toFixed(2)} cm²`
-  };
-}
-
-function detectEdgewear(cv: any, rgba: any, pxPerCm: number): FlawItem | null {
-  // Heuristic: look at perimeter strip; count edge irregularities / high gradient pixels.
-  const strip = perimeterStripMask(cv, rgba.cols, rgba.rows, 18);
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const edges = new cv.Mat();
-  cv.Canny(gray, edges, 50, 150);
-
-  const masked = new cv.Mat();
-  cv.bitwise_and(edges, strip, masked);
-
-  // Convert edge pixel count to an approximate "length" by dividing by strip thickness.
-  const count = cv.countNonZero(masked);
-  const approxLenPx = count / 6; // heuristic scale
-  const lenCm = approxLenPx / pxPerCm;
-
-  const sev: Severity =
-    lenCm <= 0 ? 'NONE' :
-    lenCm <= TUNING.edgewearSlightCm ? 'Slight' :
-    lenCm <= TUNING.edgewearMinorCm ? 'Minor' :
-    lenCm <= TUNING.edgewearModerateCm ? 'Moderate' :
-    'Major';
-
-  strip.delete();
-  gray.delete();
-  edges.delete();
-  masked.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Edgewear',
-    severity: sev,
-    points: severityToPoints(sev),
-    metric: `Perimeter wear length ≈ ${lenCm.toFixed(2)} cm`
-  };
-}
-
-function detectIndentation(cv: any, rgba: any, pxPerMm: number): FlawItem | null {
-  // Heuristic: small, high-contrast blobs.
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const blur = new cv.Mat();
-  cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-
-  const lap = new cv.Mat();
-  cv.Laplacian(blur, lap, cv.CV_8U);
-  const thr = new cv.Mat();
-  cv.threshold(lap, thr, 30, 255, cv.THRESH_BINARY);
-
-  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-  const opened = new cv.Mat();
-  cv.morphologyEx(thr, opened, cv.MORPH_OPEN, kernel);
-
-  const areaPx = cv.countNonZero(opened);
-  const areaMm2 = areaPx / (pxPerMm * pxPerMm);
-
-  let sev: Severity = 'NONE';
-  if (areaMm2 > 0) {
-    if (areaMm2 <= TUNING.indentationSlightMm2) sev = 'Slight';
-    else if (areaMm2 <= TUNING.indentationModerateMm2) sev = 'Moderate';
-    else sev = 'Major';
-  }
-
-  gray.delete();
-  blur.delete();
-  lap.delete();
-  thr.delete();
-  kernel.delete();
-  opened.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Indentation',
-    severity: sev === 'Moderate' ? 'Moderate' : sev,
-    points: severityToPoints(sev === 'Major' ? 'Major' : sev),
-    metric: `Indentation area ≈ ${areaMm2.toFixed(2)} mm²`
-  };
-}
-
-function detectGrime(cv: any, rgba: any, pxPerCm: number, pxPerMm: number): FlawItem | null {
-  // Heuristic: detect low-saturation dark patches in border strip.
-  const hsv = new cv.Mat();
-  cv.cvtColor(rgba, hsv, cv.COLOR_RGBA2HSV, 0);
-  const channels = new cv.MatVector();
-  cv.split(hsv, channels);
-  const s = channels.get(1);
-  const v = channels.get(2);
-
-  const lowSat = new cv.Mat();
-  cv.threshold(s, lowSat, 60, 255, cv.THRESH_BINARY_INV);
-  const dark = new cv.Mat();
-  cv.threshold(v, dark, 80, 255, cv.THRESH_BINARY_INV);
-
-  const grimeMask = new cv.Mat();
-  cv.bitwise_and(lowSat, dark, grimeMask);
-
-  // Restrict to perimeter strip where grime/stain is more visible
-  const strip = perimeterStripMask(cv, rgba.cols, rgba.rows, 40);
-  const masked = new cv.Mat();
-  cv.bitwise_and(grimeMask, strip, masked);
-
-  const areaPx = cv.countNonZero(masked);
-  const areaCm2 = areaPx / (pxPerCm * pxPerCm);
-  const areaMm2 = areaPx / (pxPerMm * pxPerMm);
-
-  let sev: Severity = 'NONE';
-  if (areaMm2 > 0 && areaMm2 <= TUNING.grimeSlightMm2) {
-    sev = 'Slight';
-  } else if (areaCm2 > 0 && areaCm2 <= TUNING.grimeMinorCm2) {
-    sev = 'Minor';
-  } else if (areaCm2 > TUNING.grimeMinorCm2 && areaCm2 <= TUNING.grimeModerateCm2) {
-    sev = 'Moderate';
-  } else if (areaCm2 > TUNING.grimeModerateCm2) {
-    sev = 'Major';
-  }
-
-  hsv.delete();
-  channels.delete();
-  s.delete();
-  v.delete();
-  lowSat.delete();
-  dark.delete();
-  grimeMask.delete();
-  strip.delete();
-  masked.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Grime',
-    severity: sev,
-    points: severityToPoints(sev),
-    metric: `Area ≈ ${sev === 'Slight' ? areaMm2.toFixed(2) + ' mm²' : areaCm2.toFixed(2) + ' cm²'}`
-  };
-}
-
-function detectBends(cv: any, rgba: any, pxPerCm: number): FlawItem | null {
-  // Heuristic: large-scale crease lines: use Scharr gradients + Hough.
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const blur = new cv.Mat();
-  cv.GaussianBlur(gray, blur, new cv.Size(11, 11), 0);
-
-  const edges = new cv.Mat();
-  cv.Canny(blur, edges, 20, 60);
-
-  const lines = new cv.Mat();
-  cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 120, 120, 15);
-
-  let longestPx = 0;
-  for (let i = 0; i < lines.rows; i++) {
-    const x1 = lines.data32S[i * 4 + 0];
-    const y1 = lines.data32S[i * 4 + 1];
-    const x2 = lines.data32S[i * 4 + 2];
-    const y2 = lines.data32S[i * 4 + 3];
-    const len = Math.hypot(x2 - x1, y2 - y1);
-    if (len > longestPx) longestPx = len;
-  }
-
-  const lenCm = longestPx / pxPerCm;
-  let sev: Severity = 'NONE';
-  if (lenCm > 0) {
-    if (lenCm <= TUNING.bendMinorCm) sev = 'Minor';
-    else if (lenCm <= TUNING.bendModerateCm) sev = 'Moderate';
-    else sev = 'Major';
-  }
-
-  gray.delete();
-  blur.delete();
-  edges.delete();
-  lines.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Bend',
-    severity: sev === 'Minor' ? 'Minor' : sev,
-    points: severityToPoints(sev),
-    metric: `Longest crease-like line ≈ ${lenCm.toFixed(2)} cm`
-  };
-}
-
-function detectCornerRounding(cv: any, rgba: any): FlawItem | null {
-  // Heuristic: measure corner radius by fitting circle to corner edge pixels.
-  // We approximate by sampling a small patch and estimating curvature via distance transform.
-  const gray = new cv.Mat();
-  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY, 0);
-  const edges = new cv.Mat();
-  cv.Canny(gray, edges, 50, 150);
-
-  const patchSize = 90;
-  const corners = [
-    { name: 'TL', x: 0, y: 0 },
-    { name: 'TR', x: rgba.cols - patchSize, y: 0 },
-    { name: 'BR', x: rgba.cols - patchSize, y: rgba.rows - patchSize },
-    { name: 'BL', x: 0, y: rgba.rows - patchSize }
-  ];
-
-  const radii: number[] = [];
-  for (const c of corners) {
-    const roi = edges.roi(new cv.Rect(c.x, c.y, patchSize, patchSize));
-    const inv = new cv.Mat();
-    cv.threshold(roi, inv, 1, 255, cv.THRESH_BINARY_INV);
-    const dist = new cv.Mat();
-    cv.distanceTransform(inv, dist, cv.DIST_L2, 3);
-    // radius proxy: max distance in patch
-    const mm = cv.minMaxLoc(dist);
-    radii.push(mm.maxVal);
-    roi.delete();
-    inv.delete();
-    dist.delete();
-  }
-
-  const radiusPx = radii.reduce((a, b) => a + b, 0) / radii.length;
-  const effectiveRadiusPx = Math.max(0, radiusPx - TUNING.cornerNaturalRadiusAllowancePx);
-
-  let sev: Severity = 'NONE';
-  if (effectiveRadiusPx >= TUNING.cornerRadiusMajorPx) sev = 'Major';
-  else if (effectiveRadiusPx >= TUNING.cornerRadiusModeratePx) sev = 'Moderate';
-  else if (effectiveRadiusPx >= TUNING.cornerRadiusMinorPx) sev = 'Minor';
-  else if (effectiveRadiusPx >= TUNING.cornerRadiusSlightPx) sev = 'Slight';
-
-  gray.delete();
-  edges.delete();
-
-  if (sev === 'NONE') return null;
-  return {
-    category: 'Corner Rounding',
-    severity: sev,
-    points: severityToPoints(sev),
-    metric: `Avg corner radius ≈ ${radiusPx.toFixed(1)} px (${effectiveRadiusPx.toFixed(1)} px over natural allowance)`
-  };
-}
-
-function areaToSeverity(areaCm2: number, t: { slight: number; minor: number; moderate: number; major: number }): Severity {
-  if (areaCm2 <= 0) return 'NONE';
-  if (areaCm2 <= t.slight) return 'Slight';
-  if (areaCm2 <= t.minor) return 'Minor';
-  if (areaCm2 <= t.moderate) return 'Moderate';
-  if (areaCm2 <= t.major) return 'Major';
-  return 'Major';
-}
-
-function perimeterStripMask(cv: any, w: number, h: number, thickness: number): any {
-  const mask = new cv.Mat.zeros(h, w, cv.CV_8UC1);
-  // top
-  cv.rectangle(mask, new cv.Point(0, 0), new cv.Point(w - 1, thickness), new cv.Scalar(255), -1);
-  // bottom
-  cv.rectangle(mask, new cv.Point(0, h - thickness - 1), new cv.Point(w - 1, h - 1), new cv.Scalar(255), -1);
-  // left
-  cv.rectangle(mask, new cv.Point(0, 0), new cv.Point(thickness, h - 1), new cv.Scalar(255), -1);
-  // right
-  cv.rectangle(mask, new cv.Point(w - thickness - 1, 0), new cv.Point(w - 1, h - 1), new cv.Scalar(255), -1);
-  return mask;
-}
-
-// =========================
 // Overlay rendering
 // =========================
 function drawOverlay(cv: any, rectifiedRGBA: any, centering: CenteringResult | null, flaws: FlawResult): any {
@@ -5487,19 +5342,6 @@ function drawOverlay(cv: any, rectifiedRGBA: any, centering: CenteringResult | n
   );
 
   return overlay;
-}
-
-// =========================
-// Confidence
-// =========================
-function computeConfidence(args: { blurVar: number; glareFrac: number; skewAngleDeg: number; centeringOk: boolean; reasonsCount: number }): number {
-  const blurScore = clamp01((args.blurVar - TUNING.blurVarianceThreshold) / (TUNING.blurVarianceThreshold * 2));
-  const glareScore = clamp01(1 - args.glareFrac / (TUNING.glareMaxFrac * 1.5));
-  const skewScore = clamp01(1 - Math.abs(args.skewAngleDeg) / (TUNING.maxSkewAngleDeg * 1.5));
-  const centeringScore = args.centeringOk ? 1 : 0.2;
-  const penalty = Math.min(0.6, args.reasonsCount * 0.12);
-  const base = 0.15 + 0.35 * blurScore + 0.25 * glareScore + 0.15 * skewScore + 0.10 * centeringScore;
-  return clamp01(base - penalty);
 }
 
 function clamp01(x: number): number {

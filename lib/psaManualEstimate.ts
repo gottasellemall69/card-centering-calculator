@@ -31,6 +31,7 @@ export type ManualFlawObservation = {
 
 export type ManualQualityObservation = {
   cardDetected?: boolean;
+  cardTouchesFrame?: boolean;
   fullFrontVisible?: boolean;
   readable?: boolean;
   imageQualityScore?: number;
@@ -109,6 +110,9 @@ function defaultLocationForCategory(category: DetectedFinding['category']): stri
 
 function buildManualQualityAssessment(input: ManualPsaObservation): QualityAssessment {
   const imageQualityScore = clamp01(input.quality?.imageQualityScore ?? input.confidence ?? 0.65);
+  const cardDetected = input.quality?.cardDetected ?? true;
+  const fullFrontVisible = input.quality?.fullFrontVisible ?? true;
+  const cardTouchesFrame = input.quality?.cardTouchesFrame ?? !fullFrontVisible;
   return {
     readable: input.quality?.readable ?? true,
     imageQualityScore,
@@ -116,8 +120,9 @@ function buildManualQualityAssessment(input: ManualPsaObservation): QualityAsses
     meanLuma: 0,
     stdLuma: 0,
     resolution: { width: 0, height: 0, longEdgePx: 0 },
-    cardDetected: input.quality?.cardDetected ?? true,
-    fullFrontVisible: input.quality?.fullFrontVisible ?? true,
+    cardDetected,
+    cardTouchesFrame,
+    fullFrontVisible,
     checks: []
   };
 }
