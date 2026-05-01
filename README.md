@@ -25,6 +25,17 @@ npm run dev
 ```
 Open the local dev server in your browser.
 
+## Optional OpenAI review
+The app can run a server-side AI review after the deterministic local grade completes. This does not replace the centering math or grade-cap logic; it only flags obvious missed defects, likely false positives, image-quality issues, and manual-review needs.
+
+Configure the server-side key in `.env.local`:
+```bash
+OPENAI_API_KEY="sk-..."
+OPENAI_GRADER_MODEL="gpt-5-nano"
+```
+
+The browser calls `POST /api/grade-ai`; the key stays server-side. The default model is `gpt-5-nano` for lowest cost, and the route sends the rectified image at high detail plus the source image at low detail for context.
+
 ## How it works
 ### 1) Card detection + rectification
 - Canny edges + contour search for the largest 4-point polygon

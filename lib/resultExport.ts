@@ -1,4 +1,5 @@
 import type { GradeResult } from '@/lib/grader';
+import type { AIReviewResult } from '@/lib/aiReview';
 
 export type FlatGradeRow = {
   image_name: string;
@@ -20,11 +21,18 @@ export type FlatGradeRow = {
   corner_findings: string;
   edge_findings: string;
   surface_findings: string;
+  ai_review_model: string;
+  ai_review_agreement: string;
+  ai_review_confidence: string;
+  ai_recommended_grade: string;
+  ai_adjustment: string;
+  ai_manual_review_required: 'YES' | 'NO' | '';
+  ai_top_reasons: string;
   top_reasons: string;
   limitations: string;
 };
 
-export function flattenGradeResult(filename: string, result: GradeResult): FlatGradeRow {
+export function flattenGradeResult(filename: string, result: GradeResult, aiReview?: AIReviewResult): FlatGradeRow {
   const report = result.report;
   const joinFindings = (items: Array<{ flawType: string; severity: string; location: string }> | undefined) =>
     items?.map((item) => `${item.flawType}:${item.severity}@${item.location}`)?.join(' | ') ?? '';
@@ -49,6 +57,15 @@ export function flattenGradeResult(filename: string, result: GradeResult): FlatG
     corner_findings: joinFindings(report?.cornerFindings),
     edge_findings: joinFindings(report?.edgeFindings),
     surface_findings: joinFindings(report?.surfaceFindings),
+    ai_review_model: aiReview?.model ?? '',
+    ai_review_agreement: aiReview?.overallAgreement ?? '',
+    ai_review_confidence: aiReview ? `${aiReview.confidence} (${aiReview.confidenceScore.toFixed(2)})` : '',
+    ai_recommended_grade: aiReview ? `${aiReview.recommendedFinalGrade.gradeLabel} (${aiReview.recommendedFinalGrade.psaNumeric})` : '',
+    ai_adjustment: aiReview
+      ? `${aiReview.gradeAdjustment.shouldAdjust ? 'YES' : 'NO'}: ${aiReview.gradeAdjustment.reason}`
+      : '',
+    ai_manual_review_required: aiReview ? (aiReview.manualReviewRequired ? 'YES' : 'NO') : '',
+    ai_top_reasons: aiReview?.topReasons?.join(' | ') ?? '',
     top_reasons: report?.topReasons?.join(' | ') ?? '',
     limitations: report?.limitations?.join(' | ') ?? ''
   };

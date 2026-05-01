@@ -9,8 +9,10 @@ import { isIdentityNormalization } from '@/lib/manualAlignment';
 import { OverlayViewer, type ManualCenteringView } from '@/components/OverlayViewer';
 import { flattenGradeResult, serializeGradeRowsToCsv } from '@/lib/resultExport';
 import { finalGradeFromCaps } from '@/lib/rubric';
+import type { AIReviewResult } from '@/lib/aiReview';
 
 type RowStatus = 'PENDING' | 'PREPARING' | 'REVIEW' | 'PROCESSING' | 'DONE' | 'ERROR';
+type AIReviewStatus = 'IDLE' | 'REQUESTING' | 'DONE' | 'ERROR';
 
 type Row = {
   id: string;
@@ -22,6 +24,9 @@ type Row = {
   completedAtMs?: number;
   preview?: GradeResult;
   result?: GradeResult;
+  aiReview?: AIReviewResult;
+  aiReviewStatus?: AIReviewStatus;
+  aiReviewError?: string;
   manualCentering?: ManualCenteringView | null;
   manualNormalization?: ManualImageNormalization | null;
   surfaceFinishMode: SurfaceFinishMode;
@@ -35,6 +40,7 @@ type ResultModalPayload = {
   rowId: string;
   filename: string;
   result: GradeResult;
+  aiReview?: AIReviewResult;
   overlayObjectURL?: string;
   rectifiedObjectURL?: string;
   sourceObjectURL: string;
@@ -64,6 +70,7 @@ type WorkerResponse = WorkerPreparedMessage | WorkerDoneMessage | WorkerErrorMes
 
 type PrepareOutput = { result: GradeResult; engine: 'WORKER'; };
 type GradeOutput = { result: GradeResult; overlayBlob: Blob; rectifiedBlob: Blob; engine: 'WORKER'; };
+type AIReviewApiResponse = { ok: true; review: AIReviewResult } | { ok: false; error: string };
 
 const WORKER_TASK_TIMEOUT_MS = 20000;
 
@@ -378,6 +385,7 @@ export default function Page() {
           file,
           status: 'PENDING',
           sourceObjectURL: URL.createObjectURL(file),
+          aiReviewStatus: 'IDLE',
           manualCentering: null,
           manualNormalization: null,
           surfaceFinishMode: 'standard'
@@ -417,6 +425,9 @@ export default function Page() {
               completedAtMs: undefined,
               preview: undefined,
               result: undefined,
+              aiReview: undefined,
+              aiReviewStatus: 'IDLE',
+              aiReviewError: undefined,
               overlayObjectURL: undefined,
               rectifiedObjectURL: undefined
             }
@@ -487,6 +498,9 @@ export default function Page() {
           ...row,
           status: 'PROCESSING',
           error: undefined,
+          aiReview: undefined,
+          aiReviewStatus: 'IDLE',
+          aiReviewError: undefined,
           startedAtMs: Date.now(),
           completedAtMs: undefined
         }
@@ -521,6 +535,9 @@ export default function Page() {
             ...row,
             status: 'DONE',
             result: finalResult,
+            aiReview: undefined,
+            aiReviewStatus: 'IDLE',
+            aiReviewError: undefined,
             overlayObjectURL,
             rectifiedObjectURL,
             engine,
@@ -534,6 +551,7 @@ export default function Page() {
         rowId: selected.id,
         filename: selected.filename,
         result: finalResult,
+        aiReview: undefined,
         overlayObjectURL,
         rectifiedObjectURL,
         sourceObjectURL: selected.sourceObjectURL,
@@ -547,6 +565,83 @@ export default function Page() {
             status: 'ERROR',
             error: String(error?.message ?? error),
             completedAtMs: Date.now()
+          }
+          : row
+      )));
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const reviewSelectedWithAI = async () => {
+    if (!selected || !displayedResult) return;
+
+    const rowId = selected.id;
+    setIsProcessing(true);
+    setBatchProgress(null);
+    setRows((prev) => prev.map((row) => (
+      row.id === rowId
+        ? {
+          ...row,
+          aiReview: undefined,
+          aiReviewStatus: 'REQUESTING',
+          aiReviewError: undefined
+        }
+        : row
+    )));
+
+    try {
+      const form = new FormData();
+      form.append('filename', selected.filename);
+      form.append('result', JSON.stringify(displayedResult));
+      form.append('detail', 'high');
+      form.append('sourceImage', selected.file, selected.filename);
+
+      if (selected.rectifiedObjectURL) {
+        const rectifiedResponse = await fetch(selected.rectifiedObjectURL);
+        if (!rectifiedResponse.ok) {
+          throw new Error(`Could not read rectified image for AI review (${rectifiedResponse.status}).`);
+        }
+        const rectifiedBlob = await rectifiedResponse.blob();
+        form.append(
+          'rectifiedImage',
+          new File([rectifiedBlob], `rectified-${selected.filename}.png`, { type: rectifiedBlob.type || 'image/png' })
+        );
+      }
+
+      const response = await fetch('/api/grade-ai', {
+        method: 'POST',
+        body: form
+      });
+      const payload = await response.json().catch(() => null) as AIReviewApiResponse | null;
+      if (!response.ok || !payload || !payload.ok) {
+        const message = payload && !payload.ok ? payload.error : `AI review failed (${response.status}).`;
+        throw new Error(message);
+      }
+
+      setRows((prev) => prev.map((row) => (
+        row.id === rowId
+          ? {
+            ...row,
+            aiReview: payload.review,
+            aiReviewStatus: 'DONE',
+            aiReviewError: undefined
+          }
+          : row
+      )));
+      setResultModal((prev) => (
+        prev?.rowId === rowId
+          ? { ...prev, result: displayedResult, aiReview: payload.review }
+          : prev
+      ));
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      setRows((prev) => prev.map((row) => (
+        row.id === rowId
+          ? {
+            ...row,
+            aiReviewStatus: 'ERROR',
+            aiReviewError: message
           }
           : row
       )));
@@ -583,7 +678,12 @@ export default function Page() {
   const downloadJSON = () => {
     const payload = rows
       .filter(hasResult)
-      .map((row) => ({ id: row.id, filename: row.filename, ...row.result }));
+      .map((row) => ({
+        id: row.id,
+        filename: row.filename,
+        aiReview: row.aiReview ?? null,
+        ...row.result
+      }));
     const blob = new Blob([JSON.stringify({ generatedAt: new Date().toISOString(), results: payload }, null, 2)], {
       type: 'application/json'
     });
@@ -598,7 +698,7 @@ export default function Page() {
   const downloadCSV = () => {
     const data = rows
       .filter(hasResult)
-      .map((row) => flattenGradeResult(row.filename, row.result));
+      .map((row) => flattenGradeResult(row.filename, row.result, row.aiReview));
     const csv = serializeGradeRowsToCsv(data);
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -619,6 +719,10 @@ export default function Page() {
     && !!selected
     && selected.status !== 'PREPARING'
     && selected.status !== 'PROCESSING'
+    && !isProcessing;
+  const canReviewWithAI = !!selected
+    && !!displayedResult
+    && selected.aiReviewStatus !== 'REQUESTING'
     && !isProcessing;
 
   return (
@@ -741,6 +845,7 @@ export default function Page() {
                 <th>File</th>
                 <th>Status</th>
                 <th>Engine</th>
+                <th>AI</th>
                 <th>Elapsed</th>
                 <th>Grade</th>
                 <th>Est. #</th>
@@ -752,7 +857,7 @@ export default function Page() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="small">No files yet.</td>
+                  <td colSpan={10} className="small">No files yet.</td>
                 </tr>
               ) : (
                 rows.map((row) => {
@@ -776,6 +881,7 @@ export default function Page() {
                       </td>
                       <td>{row.status}</td>
                       <td>{row.engine ?? '-'}</td>
+                      <td>{formatAIReviewStatus(row)}</td>
                       <td>{getElapsedLabel(row)}</td>
                       <td>
                         {displayRowResult ? (
@@ -868,6 +974,7 @@ export default function Page() {
                       rowId: selected.id,
                       filename: selected.filename,
                       result: displayedResult,
+                      aiReview: selected.aiReview,
                       overlayObjectURL: selected.overlayObjectURL,
                       rectifiedObjectURL: selected.rectifiedObjectURL,
                       sourceObjectURL: selected.sourceObjectURL,
@@ -875,6 +982,20 @@ export default function Page() {
                     })}
                   >
                     View full evidence
+                  </button>
+                ) : null}
+                {displayedResult ? (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void reviewSelectedWithAI()}
+                    disabled={!canReviewWithAI}
+                  >
+                    {selected.aiReviewStatus === 'REQUESTING'
+                      ? 'AI reviewing...'
+                      : selected.aiReview
+                        ? 'Re-run AI review'
+                        : 'Run AI review'}
                   </button>
                 ) : null}
                 <button
@@ -989,6 +1110,20 @@ export default function Page() {
                       : displayedResult.flaws.totalPoints}
                   </div>
                 </div>
+
+                {selected.aiReviewStatus === 'ERROR' && selected.aiReviewError ? (
+                  <div className="notice" style={{ marginTop: 10 }}>
+                    {`AI review error: ${selected.aiReviewError}`}
+                  </div>
+                ) : null}
+
+                {selected.aiReview ? (
+                  <AIReviewPanel review={selected.aiReview} />
+                ) : (
+                  <div className="notice" style={{ marginTop: 10 }}>
+                    Optional AI review is available after local grading. It can flag obvious missed defects or false positives, but the app still uses the deterministic centering and grade-cap math above.
+                  </div>
+                )}
 
                 <h3 style={{ margin: '14px 0 8px', fontSize: 14 }}>Image quality</h3>
                 <div className="kv"><div className="small">Card detected</div><div>{displayedResult.report?.cardDetected ? 'YES' : 'NO'}</div></div>
@@ -1146,6 +1281,71 @@ function hasResult(row: Row): row is Row & { result: GradeResult } {
   return Boolean(row.result);
 }
 
+function formatAIReviewStatus(row: Row): string {
+  if (row.aiReviewStatus === 'REQUESTING') return 'Reviewing';
+  if (row.aiReviewStatus === 'ERROR') return 'Error';
+  if (row.aiReview) return 'Reviewed';
+  return '-';
+}
+
+function AIReviewPanel({ review }: { review: AIReviewResult }) {
+  const missedDefectCount = review.defectReview.missedDefects.length;
+  const falsePositiveCount = review.defectReview.possibleFalsePositives.length;
+  const hasGraderRemarks = review.graderRemarks && typeof review.graderRemarks === 'object';
+  return (
+    <section style={{ marginTop: 14 }}>
+      <h3 style={{ margin: '0 0 8px', fontSize: 14 }}>AI Review</h3>
+      <div className="kv"><div className="small">Model</div><div>{review.model}</div></div>
+      <div className="kv"><div className="small">Agreement</div><div>{review.overallAgreement.replaceAll('_', ' ')}</div></div>
+      <div className="kv"><div className="small">Confidence</div><div>{review.confidence} ({review.confidenceScore.toFixed(2)})</div></div>
+      <div className="kv"><div className="small">Recommended grade</div><div>{review.recommendedFinalGrade.gradeLabel} (PSA {review.recommendedFinalGrade.psaNumeric})</div></div>
+      <div className="kv"><div className="small">Adjust local result</div><div>{review.gradeAdjustment.shouldAdjust ? 'YES' : 'NO'} - {review.gradeAdjustment.reason}</div></div>
+      <div className="kv"><div className="small">Manual review</div><div>{review.manualReviewRequired ? 'YES' : 'NO'}</div></div>
+      <div className="kv"><div className="small">Centering check</div><div>{review.centeringReview.agreesWithMeasurement ? 'Agrees' : 'Questioned'} - {review.centeringReview.suspectedIssue || 'No issue noted'}</div></div>
+      <div className="kv"><div className="small">Defect deltas</div><div>{missedDefectCount} missed / {falsePositiveCount} possible false positives</div></div>
+
+      {hasGraderRemarks ? (
+        <>
+          <h4 style={{ margin: '12px 0 6px', fontSize: 13, fontWeight: 600 }}>PSA Grader Remarks</h4>
+          <div className="small" style={{ marginTop: 6 }}>
+            <b>Overall Assessment:</b> {review.graderRemarks.overallAssessment}
+          </div>
+          <div className="small" style={{ marginTop: 6 }}>
+            <b>Grade Rationale:</b> {review.graderRemarks.gradeRationale}
+          </div>
+          <div className="small" style={{ marginTop: 6 }}>
+            <b>Key Findings:</b> {review.graderRemarks.keyFindings}
+          </div>
+          <div className="small" style={{ marginTop: 6 }}>
+            <b>Final Recommendation:</b> {review.graderRemarks.finalRecommendation}
+          </div>
+        </>
+      ) : null}
+
+      <div className="small" style={{ marginTop: 8 }}>
+        {review.topReasons.length ? review.topReasons.join(' | ') : review.recommendedFinalGrade.reason}
+      </div>
+      {review.defectReview.severitySummary ? (
+        <div className="small" style={{ marginTop: 8 }}>{review.defectReview.severitySummary}</div>
+      ) : null}
+      {missedDefectCount || falsePositiveCount ? (
+        <ul style={{ margin: '8px 0 0', paddingLeft: 18 }} className="small">
+          {[...review.defectReview.missedDefects, ...review.defectReview.possibleFalsePositives].map((finding, index) => (
+            <li key={`${finding.category}-${finding.location}-${index}`}>
+              <b>{finding.flawType}</b>: {finding.severity} at {finding.location}, confidence {finding.confidence} - {finding.suggestedAction}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {review.limitations.length ? (
+        <div className="small" style={{ marginTop: 8 }}>
+          Limitations: {review.limitations.join(' | ')}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function toManualGuideOverride(
   seedCentering: GradeResult['centering'] | null | undefined,
   manualCentering: ManualCenteringView | null | undefined,
@@ -1211,6 +1411,7 @@ function EstimateEvidenceModal({
   onClose: () => void;
 }) {
   const result = payload.result;
+  const aiReview = payload.aiReview;
   const centering = result.centering ?? null;
   const mm = deriveCenteringMillimeters(centering);
   const report = result.report;
@@ -1278,6 +1479,12 @@ function EstimateEvidenceModal({
               <div className="small">Reasons: {result.final.unscorableReasons.map((reason) => `${reason.code}: ${reason.message}`).join(' | ')}</div>
             ) : null}
           </section>
+
+          {aiReview ? (
+            <section className="resultModalSection">
+              <AIReviewPanel review={aiReview} />
+            </section>
+          ) : null}
 
           <section className="resultModalSection">
             <h3>Centering Evidence + Calculations</h3>
