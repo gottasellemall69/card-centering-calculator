@@ -762,22 +762,22 @@ function buildManualCentering(
   const cardWidth = Math.max( 1, card.maxX - card.minX + 1 );
   const cardHeight = Math.max( 1, card.maxY - card.minY + 1 );
 
-  const leftPx = Math.max( 1, inner.minX - card.minX );
-  const rightPx = Math.max( 1, card.maxX - inner.maxX );
-  const topPx = Math.max( 1, inner.minY - card.minY );
-  const bottomPx = Math.max( 1, card.maxY - inner.maxY );
+  const leftPx = Math.max( 0, inner.minX - card.minX );
+  const rightPx = Math.max( 0, card.maxX - inner.maxX );
+  const topPx = Math.max( 0, inner.minY - card.minY );
+  const bottomPx = Math.max( 0, card.maxY - inner.maxY );
 
   const lrTotal = leftPx + rightPx;
   const tbTotal = topPx + bottomPx;
-  const leftPct = ( leftPx / lrTotal ) * 100;
-  const rightPct = ( rightPx / lrTotal ) * 100;
-  const topPct = ( topPx / tbTotal ) * 100;
-  const bottomPct = ( bottomPx / tbTotal ) * 100;
+  const leftPct = lrTotal > 0 ? ( leftPx / lrTotal ) * 100 : 0;
+  const rightPct = lrTotal > 0 ? ( rightPx / lrTotal ) * 100 : 0;
+  const topPct = tbTotal > 0 ? ( topPx / tbTotal ) * 100 : 0;
+  const bottomPct = tbTotal > 0 ? ( bottomPx / tbTotal ) * 100 : 0;
 
-  const lrWorst = Math.max( leftPct, rightPct );
-  const tbWorst = Math.max( topPct, bottomPct );
-  const lrRatio = `${ Math.round( lrWorst ) }/${ Math.round( Math.min( leftPct, rightPct ) ) }`;
-  const tbRatio = `${ Math.round( tbWorst ) }/${ Math.round( Math.min( topPct, bottomPct ) ) }`;
+  const lrWorst = lrTotal > 0 ? Math.max( leftPct, rightPct ) : 100;
+  const tbWorst = tbTotal > 0 ? Math.max( topPct, bottomPct ) : 100;
+  const lrRatio = `${ Math.round( lrWorst ) }/${ Math.round( lrTotal > 0 ? Math.min( leftPct, rightPct ) : 0 ) }`;
+  const tbRatio = `${ Math.round( tbWorst ) }/${ Math.round( tbTotal > 0 ? Math.min( topPct, bottomPct ) : 0 ) }`;
   const worst = lrWorst >= tbWorst
     ? { axis: 'LR' as const, ratio: lrRatio, worstSidePct: lrWorst }
     : { axis: 'TB' as const, ratio: tbRatio, worstSidePct: tbWorst };

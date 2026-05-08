@@ -768,7 +768,7 @@ async function analyzeCardFrontCanvasFallback(
       report: buildStructuredGradeReport({
         imageName: file.name,
         quality: qualityAssessment,
-        centering: previewCentering,
+        centering,
         flaws: undefined,
         confidenceCeiling,
         finalGradeLabel: previewCap.gradeLabel,
@@ -2322,8 +2322,15 @@ function detectInnerEdgeDistanceForSample(
   const diff = Math.abs(colorCandidate - gradientCandidate);
   if (diff <= 3) return (colorCandidate + gradientCandidate) / 2;
 
-  // For centering, prefer the first strong border->design transition from the outer edge inward.
-  return Math.min(colorCandidate, gradientCandidate);
+  const toleratedDisagreement = Math.max(6, maxBorder * 0.08);
+  if (diff <= toleratedDisagreement) {
+    return (colorCandidate * 0.65) + (gradientCandidate * 0.35);
+  }
+
+  // The color transition requires a sustained departure from the sampled border color.
+  // When it strongly disagrees with a single gradient peak, the gradient is often early
+  // paper texture or edge noise rather than the inner border-to-design boundary.
+  return colorCandidate;
 }
 
 function robustBorderDistance(values: number[], expectedSampleCount: number, maxBorder: number): number | null {
@@ -2534,22 +2541,22 @@ export function buildCanvasCentering(
   const maxX = clampInt(rawInner.maxX, minX + 1, card.maxX);
   const maxY = clampInt(rawInner.maxY, minY + 1, card.maxY);
 
-  const leftPx = Math.max(1, minX - card.minX);
-  const rightPx = Math.max(1, card.maxX - maxX);
-  const topPx = Math.max(1, minY - card.minY);
-  const bottomPx = Math.max(1, card.maxY - maxY);
+  const leftPx = Math.max(0, minX - card.minX);
+  const rightPx = Math.max(0, card.maxX - maxX);
+  const topPx = Math.max(0, minY - card.minY);
+  const bottomPx = Math.max(0, card.maxY - maxY);
 
   const lrTotal = leftPx + rightPx;
   const tbTotal = topPx + bottomPx;
-  const leftPct = (leftPx / lrTotal) * 100;
-  const rightPct = (rightPx / lrTotal) * 100;
-  const topPct = (topPx / tbTotal) * 100;
-  const bottomPct = (bottomPx / tbTotal) * 100;
-  const lrWorst = Math.max(leftPct, rightPct);
-  const tbWorst = Math.max(topPct, bottomPct);
+  const leftPct = lrTotal > 0 ? (leftPx / lrTotal) * 100 : 0;
+  const rightPct = lrTotal > 0 ? (rightPx / lrTotal) * 100 : 0;
+  const topPct = tbTotal > 0 ? (topPx / tbTotal) * 100 : 0;
+  const bottomPct = tbTotal > 0 ? (bottomPx / tbTotal) * 100 : 0;
+  const lrWorst = lrTotal > 0 ? Math.max(leftPct, rightPct) : 100;
+  const tbWorst = tbTotal > 0 ? Math.max(topPct, bottomPct) : 100;
 
-  const lrRatio = `${Math.round(lrWorst)}/${Math.round(Math.min(leftPct, rightPct))}`;
-  const tbRatio = `${Math.round(tbWorst)}/${Math.round(Math.min(topPct, bottomPct))}`;
+  const lrRatio = `${Math.round(lrWorst)}/${Math.round(lrTotal > 0 ? Math.min(leftPct, rightPct) : 0)}`;
+  const tbRatio = `${Math.round(tbWorst)}/${Math.round(tbTotal > 0 ? Math.min(topPct, bottomPct) : 0)}`;
   const worst = lrWorst >= tbWorst
     ? { axis: 'LR' as const, ratio: lrRatio, worstSidePct: lrWorst }
     : { axis: 'TB' as const, ratio: tbRatio, worstSidePct: tbWorst };
@@ -3198,14 +3205,11 @@ export function detectCanvasPsaStyleFlaws(
     scratchHotspots.some((hotspot) => hotspot.linearCount >= 3) || scratchHotspots.length >= 2
       ? 'high'
       : scratchHotspots.length >= 1 ? 'medium' : 'low';
-  // Guardrail: measured line-length alone can overfire on print textures/artwork edges.
-  // If the score model sees no meaningful scratch signal, require strong corroboration.
+  // Guardrail: measured line-length alone can overfire on halftone texture,
+  // printed outlines, holder scratches, and scan streaks. If the score model
+  // sees no meaningful scratch signal, do not convert length into grade points.
   if (scratchMeasuredSeverity !== 'NONE' && scratchScoreSeverity === 'NONE') {
-    if (scratchEvidenceStrength === 'high') {
-      scratchMeasuredSeverity = downgradeSeverityBySteps(scratchMeasuredSeverity, 2);
-    } else {
-      scratchMeasuredSeverity = 'NONE';
-    }
+    scratchMeasuredSeverity = 'NONE';
   }
   let scratchSeverity = combineDetectedSeverity(
     scratchScoreSeverity,
@@ -3331,6 +3335,14 @@ export function detectCanvasPsaStyleFlaws(
     surfaceWearMeasuredSeverity,
     surfaceWearEvidenceStrength
   );
+  if (
+    surfaceWearSeverity !== 'NONE'
+    && surfaceWearScoreSeverity === 'NONE'
+    && severityRank(surfaceWearMeasuredSeverity) <= severityRank('Slight')
+    && surfaceWearEvidenceStrength !== 'high'
+  ) {
+    surfaceWearSeverity = 'NONE';
+  }
   if (surfaceWearSeverity !== 'NONE' && finishProfile.borderTextureConfidence >= 0.45 && borderSideCount >= 2) {
     surfaceWearSeverity = downgradeSeverityBySteps(
       surfaceWearSeverity,
@@ -3362,6 +3374,14 @@ export function detectCanvasPsaStyleFlaws(
   );
   if (
     edgewearSeverity !== 'NONE'
+    && edgewearScoreSeverity === 'NONE'
+    && severityRank(edgewearMeasuredSeverity) <= severityRank('Slight')
+    && edgewearEvidenceStrength !== 'high'
+  ) {
+    edgewearSeverity = 'NONE';
+  }
+  if (
+    edgewearSeverity !== 'NONE'
     && finishProfile.borderTextureConfidence >= 0.55
     && borderSideCount >= 3
     && edgewearMeasuredSeverity === 'NONE'
@@ -3378,25 +3398,27 @@ export function detectCanvasPsaStyleFlaws(
     surfaceWearSeverity = 'NONE';
   }
 
+  const strongCornerHotspots = cornerHotspots.filter((hotspot) => hotspot.score >= 26);
+  const strongCornerCount = strongCornerHotspots.length;
   const broadPerimeterWearScore = Math.max(
     0,
     Math.max(0, borderSideCount - 1) * 8
       + Math.min(26, borderHotspotCoveragePct * 2.6)
       + Math.min(24, edgeHotspotCoveragePct * 1.1)
-      + Math.min(22, cornerHotspots.length * 5.5)
+      + Math.min(22, strongCornerCount * 5.5)
       + clamp01((borderCleanlinessScore - 28) / 42) * 18
       + clamp01((edgeWearScore - 20) / 38) * 14
       + clamp01((cornerWearScore - 14) / 36) * 12
       - finishProfile.borderTextureConfidence * 12
   );
   const broadPerimeterWearIsMajor =
-    (broadPerimeterWearScore >= 70 && borderSideCount >= 3 && cornerHotspots.length >= 2)
-    || (broadPerimeterWearScore >= 64 && borderSideCount >= 4 && cornerHotspots.length >= 3)
-    || (edgeHotspotCoveragePct >= 30 && borderSideCount >= 3 && cornerHotspots.length >= 3);
+    (broadPerimeterWearScore >= 70 && borderSideCount >= 3 && strongCornerCount >= 2)
+    || (broadPerimeterWearScore >= 64 && borderSideCount >= 4 && strongCornerCount >= 3)
+    || (edgeHotspotCoveragePct >= 30 && borderSideCount >= 3 && strongCornerCount >= 3);
   const broadPerimeterWearIsModerate =
     broadPerimeterWearIsMajor
-    || (broadPerimeterWearScore >= 48 && borderSideCount >= 3 && cornerHotspots.length >= 1)
-    || (broadPerimeterWearScore >= 55 && borderSideCount >= 2 && cornerHotspots.length >= 2);
+    || (broadPerimeterWearScore >= 48 && borderSideCount >= 3 && strongCornerCount >= 1)
+    || (broadPerimeterWearScore >= 55 && borderSideCount >= 2 && strongCornerCount >= 2);
   const broadPerimeterWearSeverity: Severity = broadPerimeterWearIsMajor
     ? 'Major'
     : broadPerimeterWearIsModerate ? 'Moderate' : 'NONE';
@@ -3409,7 +3431,7 @@ export function detectCanvasPsaStyleFlaws(
   }
   const broadCornerMinimum: Severity = broadPerimeterWearSeverity === 'Major'
     ? 'Moderate'
-    : broadPerimeterWearSeverity === 'Moderate' && cornerHotspots.length >= 2 ? 'Moderate' : 'NONE';
+    : broadPerimeterWearSeverity === 'Moderate' && strongCornerCount >= 2 ? 'Moderate' : 'NONE';
 
   if (surfaceWearSeverity !== 'NONE') {
     const hotspot = borderHotspots[0];
@@ -3477,7 +3499,7 @@ export function detectCanvasPsaStyleFlaws(
   if (broadPerimeterWearSeverity === 'Major') {
     const aggregateDefectSeverity: Exclude<Severity, 'NONE'> =
       broadPerimeterWearScore >= 88
-      && cornerHotspots.length >= 4
+      && strongCornerCount >= 4
       && edgeHotspotCoveragePct >= 32
         ? 'Major'
         : 'Moderate';
@@ -3485,7 +3507,7 @@ export function detectCanvasPsaStyleFlaws(
       category: 'shape',
       flawType: 'overall perimeter damage',
       severity: severityToFindingSeverity(aggregateDefectSeverity),
-      metric: `Overall perimeter wear index ${broadPerimeterWearScore.toFixed(1)} (${borderSideCount} affected edge${borderSideCount === 1 ? '' : 's'}, ${cornerHotspots.length} affected corner${cornerHotspots.length === 1 ? '' : 's'}, edge coverage ${edgeHotspotCoveragePct.toFixed(1)}%)`,
+      metric: `Overall perimeter wear index ${broadPerimeterWearScore.toFixed(1)} (${borderSideCount} affected edge${borderSideCount === 1 ? '' : 's'}, ${strongCornerCount} strongly affected corner${strongCornerCount === 1 ? '' : 's'}, edge coverage ${edgeHotspotCoveragePct.toFixed(1)}%)`,
       location: describeAffectedSides(borderSides),
       notes: [
         'Broad perimeter damage is scored as an aggregate defect so heavy edge, corner, and border wear cannot be diluted into a PSA 6-style result.',
@@ -3499,7 +3521,7 @@ export function detectCanvasPsaStyleFlaws(
         normalized: clamp01(broadPerimeterWearScore / 100)
       },
       evidenceStrength: 'high',
-      count: borderHotspots.length + cornerHotspots.length
+      count: borderHotspots.length + strongCornerCount
     });
     addFlawItem('Defect', aggregateDefectSeverity, finding.metric, finding);
   }
@@ -3510,17 +3532,18 @@ export function detectCanvasPsaStyleFlaws(
       : cornerWearScore > 26 ? 'Minor'
         : cornerWearScore > 15 ? 'Slight'
           : 'NONE';
-  // Affected-corner count is used to stabilize low-confidence corner detections,
-  // not to force severe grades by itself on naturally rounded/factory corners.
+  // Affected-corner count is used only when the individual corner patches have
+  // strong deviation. Count-only detections overfire on naturally rounded scan
+  // crops, soft sleeve shadows, and factory paper texture.
   const cornerMeasuredSeverity: Severity =
-    cornerHotspots.length >= 4 ? 'Moderate'
-      : cornerHotspots.length >= 3 ? 'Minor'
-      : cornerHotspots.length >= 1 ? 'Slight'
+    strongCornerCount >= 4 ? 'Moderate'
+      : strongCornerCount >= 3 ? 'Minor'
+      : strongCornerCount >= 1 ? 'Slight'
         : 'NONE';
   const cornerEvidenceStrength: EvidenceStrength =
-    cornerHotspots.length >= 2 || cornerHotspots.some((hotspot) => hotspot.score >= 34)
+    strongCornerCount >= 2 || cornerHotspots.some((hotspot) => hotspot.score >= 34)
       ? 'high'
-      : cornerHotspots.length === 1 ? 'medium' : 'low';
+      : strongCornerCount === 1 ? 'medium' : 'low';
   let cornerWearSeverity = combineDetectedSeverity(
     cornerScoreSeverity,
     cornerMeasuredSeverity,
@@ -4656,11 +4679,11 @@ export function buildCanvasQualityAssessment(args: {
     },
     {
       key: 'glare',
-      label: 'Glare / reflections',
-      observed: clippingPct > 3,
-      severity: clippingPct > 14 ? 'high' : clippingPct > 8 ? 'moderate' : clippingPct > 3 ? 'low' : 'none',
+      label: 'Tone clipping / reflections',
+      observed: clippingPct > 8,
+      severity: clippingPct > 32 ? 'high' : clippingPct > 18 ? 'moderate' : clippingPct > 8 ? 'low' : 'none',
       metric: `Tone clipping ${clippingPct.toFixed(1)}%`,
-      note: 'Clipped highlights or shadows can hide or exaggerate visible front defects.',
+      note: 'Clipped highlights or shadows can hide or exaggerate visible front defects; scans with white borders and black ink can trigger this without true glare.',
       impactsObservability: true
     },
     {
@@ -4754,8 +4777,6 @@ export function buildCanvasQualityAssessment(args: {
 export function observabilityCeilingFromQuality(quality: QualityAssessment): GradeCeilingAssessment {
   const observabilityChecks = quality.checks.filter((check) => check.impactsObservability);
   const highChecks = observabilityChecks.filter((check) => check.severity === 'high');
-  const moderateCount = observabilityChecks.filter((check) => check.severity === 'moderate').length;
-  const lowCount = observabilityChecks.filter((check) => check.severity === 'low').length;
   const highCount = highChecks.length;
   const highNonResolutionCount = highChecks.filter((check) => check.key !== 'low_resolution').length;
   const resolutionIsOnlyHighIssue = highCount === 1 && highChecks[0]?.key === 'low_resolution';
@@ -4767,25 +4788,13 @@ export function observabilityCeilingFromQuality(quality: QualityAssessment): Gra
     return gradeCapReason('confidence', { gradeLabel: 'EX 5', psaNumeric: 5 }, 'Full front borders are not completely visible, so high-grade outcomes are not supportable.');
   }
   if (highNonResolutionCount >= 2) {
-    return gradeCapReason('confidence', { gradeLabel: 'VG-EX 4', psaNumeric: 4 }, 'Multiple severe observability issues make the estimate highly conservative.');
+    return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Multiple severe observability issues make the estimate conservative.');
   }
   if (highNonResolutionCount === 1) {
-    return gradeCapReason('confidence', { gradeLabel: 'EX-MT 6', psaNumeric: 6 }, 'One severe observability issue limits how high the pre-grade can reasonably go.');
+    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'One severe observability issue limits confidence in very high-grade outcomes.');
   }
   if (resolutionIsOnlyHighIssue) {
-    if (moderateCount >= 2) {
-      return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Image resolution is low enough to limit slight-defect confidence, with additional moderate observability limits.');
-    }
-    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'Image resolution is low enough that very slight defects may be missed, so the estimate remains conservative.');
-  }
-  if (moderateCount >= 2) {
-    return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Multiple moderate image-quality issues reduce confidence in slight-defect detection.');
-  }
-  if (moderateCount === 1 || lowCount >= 3) {
-    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'Some observability limits remain, so the estimate is capped conservatively.');
-  }
-  if (lowCount >= 1) {
-    return gradeCapReason('confidence', { gradeLabel: 'MINT 9', psaNumeric: 9 }, 'Minor image-quality limits remain even though the card is generally scorable.');
+    return gradeCapReason('confidence', { gradeLabel: 'MINT 9', psaNumeric: 9 }, 'Image resolution is low enough that very slight defects may be missed.');
   }
   return gradeCapReason('confidence', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, 'Image quality is strong enough that observability does not materially lower the grade ceiling.');
 }
@@ -4825,16 +4834,6 @@ function buildCanvasUnscorableReasons(quality: QualityAssessment, innerBounds: C
       message: blurCheck.metric
         ? `Image blur is too high for reliable grading (${blurCheck.metric}).`
         : 'Image blur is too high for reliable grading.'
-    });
-  }
-
-  const glareCheck = quality.checks.find((check) => check.key === 'glare');
-  if (glareCheck?.severity === 'high') {
-    reasons.push({
-      code: 'GLARE',
-      message: glareCheck.metric
-        ? `Strong glare/reflection detected (${glareCheck.metric}).`
-        : 'Strong glare/reflection detected.'
     });
   }
 

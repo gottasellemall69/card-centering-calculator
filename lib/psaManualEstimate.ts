@@ -53,12 +53,18 @@ export type ManualPsaObservation = {
 };
 
 function ratioWorstPct(major: number, minor: number): number {
-  const total = Math.max(1, major + minor);
-  return (Math.max(major, minor) / total) * 100;
+  const safeMajor = Math.max(0, Number.isFinite(major) ? major : 0);
+  const safeMinor = Math.max(0, Number.isFinite(minor) ? minor : 0);
+  const total = safeMajor + safeMinor;
+  if (total <= 0) return 100;
+  return (Math.max(safeMajor, safeMinor) / total) * 100;
 }
 
 function ratioString(major: number, minor: number): string {
-  return `${Math.max(major, minor)}/${Math.min(major, minor)}`;
+  const safeMajor = Math.max(0, Number.isFinite(major) ? major : 0);
+  const safeMinor = Math.max(0, Number.isFinite(minor) ? minor : 0);
+  if (safeMajor + safeMinor <= 0) return '100/0';
+  return `${Math.max(safeMajor, safeMinor)}/${Math.min(safeMajor, safeMinor)}`;
 }
 
 function clamp01(value: number): number {
