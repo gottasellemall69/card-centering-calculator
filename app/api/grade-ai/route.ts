@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-import { AI_REVIEW_RESPONSE_SCHEMA, isAIReviewResult } from '@/lib/aiReview';
+import { AI_REVIEW_RESPONSE_SCHEMA, isAIReviewPayload } from '@/lib/aiReview';
 import type { GradeResult } from '@/lib/grader';
 
 export const runtime = 'nodejs';
@@ -177,7 +177,7 @@ export async function POST( request: Request ) {
     }
 
     const review = JSON.parse( outputText );
-    if ( !isAIReviewResult( review ) ) {
+    if ( !isAIReviewPayload( review ) ) {
       return NextResponse.json( { ok: false, error: 'OpenAI response did not match the AI review schema.' }, { status: 502 } );
     }
 

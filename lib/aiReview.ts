@@ -14,8 +14,7 @@ export type AIVisualFinding = {
   suggestedAction: string;
 };
 
-export type AIReviewResult = {
-  model: string;
+export type AIReviewPayload = {
   aiReviewVersion: string;
   overallAgreement: AIReviewAgreement;
   confidence: AIReviewConfidence;
@@ -58,6 +57,10 @@ export type AIReviewResult = {
   limitations: string[];
 };
 
+export type AIReviewResult = AIReviewPayload & {
+  model: string;
+};
+
 const visualFindingSchema = {
   type: 'object',
   additionalProperties: false,
@@ -86,7 +89,6 @@ export const AI_REVIEW_RESPONSE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: [
-    'model',
     'aiReviewVersion',
     'overallAgreement',
     'confidence',
@@ -102,7 +104,6 @@ export const AI_REVIEW_RESPONSE_SCHEMA = {
     'limitations'
   ],
   properties: {
-    model: { type: 'string' },
     aiReviewVersion: { type: 'string' },
     overallAgreement: {
       type: 'string',
@@ -205,15 +206,14 @@ export const AI_REVIEW_RESPONSE_SCHEMA = {
   }
 } as const;
 
-export function isAIReviewResult(value: unknown): value is AIReviewResult {
+export function isAIReviewPayload(value: unknown): value is AIReviewPayload {
   if (!value || typeof value !== 'object') return false;
-  const candidate = value as Partial<AIReviewResult>;
+  const candidate = value as Partial<AIReviewPayload>;
   const recommendedNumeric = candidate.recommendedFinalGrade?.psaNumeric;
   const fromNumeric = candidate.gradeAdjustment?.fromNumeric;
   const toNumeric = candidate.gradeAdjustment?.toNumeric;
   return (
-    typeof candidate.model === 'string'
-    && typeof candidate.aiReviewVersion === 'string'
+    typeof candidate.aiReviewVersion === 'string'
     && typeof candidate.overallAgreement === 'string'
     && typeof candidate.confidence === 'string'
     && typeof candidate.confidenceScore === 'number'
@@ -241,5 +241,12 @@ export function isAIReviewResult(value: unknown): value is AIReviewResult {
     && !!candidate.qualityReview
     && Array.isArray(candidate.topReasons)
     && Array.isArray(candidate.limitations)
+  );
+}
+
+export function isAIReviewResult(value: unknown): value is AIReviewResult {
+  return (
+    isAIReviewPayload(value)
+    && typeof (value as Partial<AIReviewResult>).model === 'string'
   );
 }
