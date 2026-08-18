@@ -248,8 +248,8 @@ export const TUNING = {
   innerEdgeMinProminence: 0.18,
 
   // Metric conversion
-  cardWidthCm: 6.4,
-  cardHeightCm: 8.9,
+  cardWidthCm: 6.35,
+  cardHeightCm: 8.89,
 
   // Scratch detection
   scratchMinLenCmSlight: 2,
@@ -3523,7 +3523,9 @@ export function detectCanvasPsaStyleFlaws(
       evidenceStrength: 'high',
       count: borderHotspots.length + strongCornerCount
     });
-    addFlawItem('Defect', aggregateDefectSeverity, finding.metric, finding);
+    // Do not add rubric points here: this aggregate is derived from the same
+    // edge/corner/surface evidence already scored above. Scoring it again would
+    // double-count correlated evidence and systematically depress grades.
   }
 
   const cornerScoreSeverity: Severity =
@@ -4775,28 +4777,18 @@ export function buildCanvasQualityAssessment(args: {
 }
 
 export function observabilityCeilingFromQuality(quality: QualityAssessment): GradeCeilingAssessment {
+  // Image quality is epistemic uncertainty, not card condition. Lowering a card's
+  // numeric grade because the photograph is poor creates a systematic downward
+  // bias. Severe quality failures are handled by buildCanvasUnscorableReasons();
+  // lesser issues reduce confidence / require review, but do not alter the grade.
   const observabilityChecks = quality.checks.filter((check) => check.impactsObservability);
-  const highChecks = observabilityChecks.filter((check) => check.severity === 'high');
-  const highCount = highChecks.length;
-  const highNonResolutionCount = highChecks.filter((check) => check.key !== 'low_resolution').length;
-  const resolutionIsOnlyHighIssue = highCount === 1 && highChecks[0]?.key === 'low_resolution';
-
-  if (!quality.cardDetected || !quality.readable) {
-    return gradeCapReason('confidence', { gradeLabel: 'PR 1', psaNumeric: 1 }, 'Image quality or card localization is too poor for a reliable front-only estimate.');
-  }
-  if (!quality.fullFrontVisible) {
-    return gradeCapReason('confidence', { gradeLabel: 'EX 5', psaNumeric: 5 }, 'Full front borders are not completely visible, so high-grade outcomes are not supportable.');
-  }
-  if (highNonResolutionCount >= 2) {
-    return gradeCapReason('confidence', { gradeLabel: 'NM 7', psaNumeric: 7 }, 'Multiple severe observability issues make the estimate conservative.');
-  }
-  if (highNonResolutionCount === 1) {
-    return gradeCapReason('confidence', { gradeLabel: 'NM-MT 8', psaNumeric: 8 }, 'One severe observability issue limits confidence in very high-grade outcomes.');
-  }
-  if (resolutionIsOnlyHighIssue) {
-    return gradeCapReason('confidence', { gradeLabel: 'MINT 9', psaNumeric: 9 }, 'Image resolution is low enough that very slight defects may be missed.');
-  }
-  return gradeCapReason('confidence', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, 'Image quality is strong enough that observability does not materially lower the grade ceiling.');
+  const issueCount = observabilityChecks.filter((check) => check.severity !== 'low').length;
+  const reason = !quality.cardDetected || !quality.readable
+    ? 'Image quality is insufficient; the result should be UNSCORABLE rather than assigned an artificially low condition grade.'
+    : issueCount > 0
+      ? `${issueCount} image-observability issue${issueCount === 1 ? '' : 's'} reduce confidence but do not change the card-condition estimate.`
+      : 'Image quality does not add an independent condition penalty.';
+  return gradeCapReason('confidence', { gradeLabel: 'GEM-MT 10', psaNumeric: 10 }, reason);
 }
 
 function buildCanvasUnscorableReasons(quality: QualityAssessment, innerBounds: ContentBounds | null): UnscorableReason[] {

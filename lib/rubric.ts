@@ -121,9 +121,10 @@ const CONDITION_RANK: Record<TcgCondition, number> = {
   Damaged: 4
 };
 
-// PSA-normalized flaw point bands used for the condition floor.
-// These bands are intentionally wider than the cap table so the final cap can
-// still distinguish adjacent PSA outcomes within the same broad condition.
+// Project heuristic flaw-point bands used for the condition floor.
+// PSA does not publish an additive defect-points formula; these values must not
+// be represented as official PSA scoring. They are calibration parameters for
+// this front-image estimator and should be validated against labeled examples.
 const PSA_FLAW_POINT_BANDS: Array<{
   condition: TcgCondition;
   minPoints: number;

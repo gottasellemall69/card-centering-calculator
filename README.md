@@ -3,7 +3,7 @@
 Front-only trading card photo grading assistant that:
 - detects the card, perspective-rectifies it
 - estimates **front centering** (L/R and T/B) and applies the PSA-style centering caps from your rubric
-- runs **heuristic flaw detection** and converts measurements into the **severity/points** table you provided
+- runs **heuristic flaw detection (the additive flaw-point model is project-specific, not an official PSA formula)** and converts measurements into the **severity/points** table you provided
 - renders a **visual overlay** (inner border box, border bands, midlines, flaw summary text)
 - batch-processes multiple images in one session and exports `results.json` and `results.csv`
 
@@ -62,7 +62,7 @@ The browser calls `POST /api/grade-ai`; the key stays server-side. The default m
   - <= 90% → PSA 3/2/1.5 cap
 
 ### 3) Flaws (heuristics)
-Measured in the rectified image using px→cm conversion (6.4cm x 8.9cm assumed).
+Measured in the rectified image using px→cm conversion (6.35cm x 8.89cm assumed (standard 2.5 x 3.5 in card)).
 - **Scratch**: Hough line segments in the interior; sum lengths → severity by your cm cutoffs
 - **Scuffing**: local texture anomaly area (|gray - blur|) → cm² thresholds
 - **Edgewear**: edge energy within a perimeter strip → approximate perimeter wear length
@@ -72,9 +72,11 @@ Measured in the rectified image using px→cm conversion (6.4cm x 8.9cm assumed)
 - **Corner rounding**: corner patch distance transform → average corner radius (px) thresholds
 
 Total points are mapped to a condition and a **grade cap**.
-Final grade = *worse* of:
+Front-image estimate = *worse* of:
 - centering cap
-- flaw cap
+- visible-flaw cap
+
+Image quality changes confidence/scoreability, not card condition. Severe quality failures return **UNSCORABLE** instead of forcing an artificially low grade.
 
 ### 4) UNSCORABLE
 The app returns **UNSCORABLE** with reasons and a lower confidence when:
