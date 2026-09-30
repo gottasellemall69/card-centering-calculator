@@ -1,3 +1,5 @@
+import { CONDITIONING_CENTERING_CAPS, CONDITIONING_MEASUREMENT_GUIDE } from './conditioningStandards';
+
 export type GradeLabel =
   | 'GEM-MT 10'
   | 'MINT 9'
@@ -71,30 +73,17 @@ export type FrontGradeDefinition = {
 // Front-only centering definitions derived from the provided PSA guide.
 // PSA 10 front centering uses the updated 55/45 threshold.
 // Back-of-card centering is intentionally ignored in this project.
-export const PSA_FRONT_GRADE_DEFINITIONS: FrontGradeDefinition[] = [
-  { gradeLabel: 'GEM-MT 10', psaNumeric: 10, maxWorstSidePctFront: 55, summary: 'Sharp corners/surface, full gloss' },
-  { gradeLabel: 'MINT 9', psaNumeric: 9, maxWorstSidePctFront: 65, summary: 'One minor flaw allowed' },
-  { gradeLabel: 'NM-MT 8', psaNumeric: 8, maxWorstSidePctFront: 70, summary: 'Very slight corner/print/border issues' },
-  { gradeLabel: 'NM 7', psaNumeric: 7, maxWorstSidePctFront: 75, summary: 'Slight wear/blemish' },
-  { gradeLabel: 'EX-MT 6', psaNumeric: 6, maxWorstSidePctFront: 80, summary: 'Visible wear, minor scratches/defects' },
-  // 5 and 4 share 85/15 front centering; flaw profile decides between them.
-  { gradeLabel: 'EX 5', psaNumeric: 5, maxWorstSidePctFront: 85, summary: 'Rounded corners, visible wear/loss of gloss' },
-  // 3, 2, 1.5, and 1 share 90/10 front centering; flaw profile decides among them.
-  { gradeLabel: 'VG 3', psaNumeric: 3, maxWorstSidePctFront: 90, summary: 'Heavy wear/scuffing/possible creases' },
-  { gradeLabel: 'PR 1', psaNumeric: 1, maxWorstSidePctFront: 100, summary: 'Extreme defects' }
-];
+export const PSA_FRONT_GRADE_DEFINITIONS: FrontGradeDefinition[] = CONDITIONING_CENTERING_CAPS.map( ( row ) => ( {
+  gradeLabel: row.gradeLabel,
+  psaNumeric: row.psaNumeric,
+  maxWorstSidePctFront: row.maxWorstSidePctFront,
+  summary: row.summary
+} ) );
 
-export const CENTERING_FRONT_CAPS: Array<{ maxWorstSidePct: number; cap: GradeCap; }> = [
-  // Worst side percentage: e.g. 55/45 => worstSidePct=55
-  { maxWorstSidePct: 55, cap: { gradeLabel: 'GEM-MT 10', psaNumeric: 10 } },
-  { maxWorstSidePct: 65, cap: { gradeLabel: 'MINT 9', psaNumeric: 9 } },
-  { maxWorstSidePct: 70, cap: { gradeLabel: 'NM-MT 8', psaNumeric: 8 } },
-  { maxWorstSidePct: 75, cap: { gradeLabel: 'NM 7', psaNumeric: 7 } },
-  { maxWorstSidePct: 80, cap: { gradeLabel: 'EX-MT 6', psaNumeric: 6 } },
-  { maxWorstSidePct: 85, cap: { gradeLabel: 'EX 5', psaNumeric: 5 } },
-  { maxWorstSidePct: 90, cap: { gradeLabel: 'VG 3', psaNumeric: 3 } },
-  { maxWorstSidePct: 100, cap: { gradeLabel: 'PR 1', psaNumeric: 1 } }
-];
+export const CENTERING_FRONT_CAPS: Array<{ maxWorstSidePct: number; cap: GradeCap; }> = PSA_FRONT_GRADE_DEFINITIONS.map( ( row ) => ( {
+  maxWorstSidePct: row.maxWorstSidePctFront,
+  cap: { gradeLabel: row.gradeLabel, psaNumeric: row.psaNumeric }
+} ) );
 
 export function centeringCapFromWorstSidePct( worstSidePct: number ): GradeCap {
   for ( const row of CENTERING_FRONT_CAPS ) {
@@ -243,106 +232,8 @@ export const TCGPLAYER_CONDITION_MATRIX = PSA_FLAW_CONDITION_MATRIX;
 export const PSA_MEASUREMENT_GUIDE: Partial<Record<WorkbookFlawCategory, {
   measuredBy: string;
   thresholds: Partial<Record<Exclude<Severity, 'NONE'>, string>>;
-  notes?: string[];
-}>> = {
-  Scratch: {
-    measuredBy: 'Sum of length',
-    thresholds: {
-      Slight: '2cm',
-      Minor: '4cm',
-      Moderate: '>4cm'
-    }
-  },
-  Scuffing: {
-    measuredBy: 'Area',
-    thresholds: {
-      Slight: '2cm²',
-      Minor: '27.72cm²',
-      Moderate: '55.44cm²',
-      Major: '110.88cm²'
-    },
-    notes: [
-      'For holographic, embossed, etched, or glitter finishes, broad factory texture should not be scored as scuffing by itself.',
-      'Prefer localized disruptions, gloss breaks, or non-uniform patches that stand apart from the card\'s expected finish pattern.'
-    ]
-  },
-  Edgewear: {
-    measuredBy: 'Sum of length',
-    thresholds: {
-      Slight: '2cm',
-      Minor: '8cm',
-      Moderate: '16cm',
-      Major: '>16cm'
-    }
-  },
-  Indentation: {
-    measuredBy: 'Sum of area or count',
-    thresholds: {
-      Slight: '1 count',
-      Minor: '4mm²',
-      Moderate: '25mm²',
-      Major: '>25mm²'
-    },
-    notes: [
-      'Slight: pinpoint, cannot show through the other side',
-      'Minor: cannot show through the other side',
-      'Moderate: can show through the other side'
-    ]
-  },
-  Grime: {
-    measuredBy: 'Area',
-    thresholds: {
-      Slight: '2.5mm²',
-      Minor: '13.75cm²',
-      Moderate: '27.5cm²'
-    },
-    notes: [ 'Major threshold not specified in the workbook' ]
-  },
-  Bend: {
-    measuredBy: 'Sum of length',
-    thresholds: {
-      Minor: '1cm',
-      Moderate: '2cm',
-      Major: '>2cm'
-    }
-  },
-  'Surface Wear': {
-    measuredBy: 'Area',
-    thresholds: {
-      Slight: '0.25cm²',
-      Minor: '1cm²',
-      Moderate: '4cm²',
-      Major: '16cm²'
-    },
-    notes: [
-      'On textured foil or embossed stock, decorative sparkle or emboss grain should not be treated as wear unless it becomes localized, inconsistent, or broken.',
-      'Border texture should be compared against the expected factory finish before treating it as whitening or surface loss.'
-    ]
-  },
-  Curling: {
-    measuredBy: 'Curl height',
-    thresholds: {
-      Slight: '5mm'
-    }
-  },
-  Fault: {
-    measuredBy: 'Area',
-    thresholds: {
-      Slight: '0.25cm²',
-      Minor: '1cm²',
-      Moderate: '4cm²',
-      Major: '16cm²'
-    }
-  },
-  Defect: {
-    measuredBy: 'Area',
-    thresholds: {
-      Slight: '0.25cm²',
-      Minor: '0.50cm²',
-      Moderate: '1cm²'
-    }
-  }
-};
+  notes?: readonly string[];
+}>> = CONDITIONING_MEASUREMENT_GUIDE;
 
 // Backward-compatible alias retained for external consumers.
 export const TCGPLAYER_MEASUREMENT_GUIDE = PSA_MEASUREMENT_GUIDE;
@@ -459,3 +350,4 @@ export function finalGradeFromCaps( a: GradeCap, b: GradeCap ): GradeCap {
   // Lower PSA number is worse.
   return a.psaNumeric <= b.psaNumeric ? a : b;
 }
+

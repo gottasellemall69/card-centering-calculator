@@ -20,6 +20,17 @@ import {
   isIdentityNormalization,
   type ManualImageNormalization
 } from './manualAlignment';
+import {
+  CONDITIONING_MEASUREMENT_THRESHOLDS,
+  CONDITIONING_OVERLAY_SPEC,
+  STANDARD_CARD_DIMENSIONS_CM,
+  STANDARDS_SOURCE_DOCUMENTS,
+  buildConditioningOverlayGeometry,
+  mmToCardHeightPx,
+  mmToCardWidthPx,
+  pxToCardHeightMillimeters,
+  pxToCardWidthMillimeters
+} from './conditioningStandards';
 
 export type UnscorableReason = {
   code:
@@ -248,30 +259,30 @@ export const TUNING = {
   innerEdgeMinProminence: 0.18,
 
   // Metric conversion
-  cardWidthCm: 6.35,
-  cardHeightCm: 8.89,
+  cardWidthCm: STANDARD_CARD_DIMENSIONS_CM.width,
+  cardHeightCm: STANDARD_CARD_DIMENSIONS_CM.height,
 
   // Scratch detection
-  scratchMinLenCmSlight: 2,
-  scratchMinLenCmMinor: 4,
-  scratchMinLenCmModerate: 4.0001, // > 4 is moderate; using epsilon
+  scratchMinLenCmSlight: CONDITIONING_MEASUREMENT_THRESHOLDS.scratch.slightCm,
+  scratchMinLenCmMinor: CONDITIONING_MEASUREMENT_THRESHOLDS.scratch.minorCm,
+  scratchMinLenCmModerate: CONDITIONING_MEASUREMENT_THRESHOLDS.scratch.moderateCmExclusiveLowerBound + 0.0001,
 
   // Scuffing area thresholds (cm^2)
-  scuffSlightCm2: 2,
-  scuffMinorCm2: 27.72,
-  scuffModerateCm2: 55.44,
-  scuffMajorCm2: 110.88,
+  scuffSlightCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.scuffing.slightCm2,
+  scuffMinorCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.scuffing.minorCm2,
+  scuffModerateCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.scuffing.moderateCm2,
+  scuffMajorCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.scuffing.majorCm2,
 
   // Edgewear (sum length in cm)
-  edgewearSlightCm: 2,
-  edgewearMinorCm: 8,
-  edgewearModerateCm: 16,
+  edgewearSlightCm: CONDITIONING_MEASUREMENT_THRESHOLDS.edgewear.slightCm,
+  edgewearMinorCm: CONDITIONING_MEASUREMENT_THRESHOLDS.edgewear.minorCm,
+  edgewearModerateCm: CONDITIONING_MEASUREMENT_THRESHOLDS.edgewear.moderateCm,
 
   // Surface wear & fault thresholds (cm^2)
-  surfaceWearSlightCm2: 0.25,
-  surfaceWearMinorCm2: 1,
-  surfaceWearModerateCm2: 4,
-  surfaceWearMajorCm2: 16
+  surfaceWearSlightCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.surfaceWear.slightCm2,
+  surfaceWearMinorCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.surfaceWear.minorCm2,
+  surfaceWearModerateCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.surfaceWear.moderateCm2,
+  surfaceWearMajorCm2: CONDITIONING_MEASUREMENT_THRESHOLDS.surfaceWear.majorCm2
 };
 
 let cvPromise: Promise<any> | null = null;
@@ -329,7 +340,6 @@ async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; 
   const cv = await getCV();
   const img = await fileToMat(cv, file);
   let rectified: any | null = null;
-  let overlay: any | null = null;
 
   try {
     const blurVar = laplacianVariance(cv, img);
@@ -420,7 +430,7 @@ async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; 
     const confidenceCeiling = observabilityCeilingFromQuality(qualityAssessment);
     const unscorableReasons = buildCanvasUnscorableReasons(qualityAssessment, innerBounds);
     if (Math.abs(skewAngleDeg) > TUNING.maxSkewAngleDeg) {
-      unscorableReasons.push({ code: 'EXTREME_SKEW', message: `Perspective skew too extreme (≈${skewAngleDeg.toFixed(1)}°).` });
+      unscorableReasons.push({ code: 'EXTREME_SKEW', message: `Perspective skew too extreme (~${skewAngleDeg.toFixed(1)} deg).` });
     }
     if (glare.frac > TUNING.glareMaxFrac && !unscorableReasons.some((reason) => reason.code === 'GLARE')) {
       unscorableReasons.push({ code: 'GLARE', message: `Glare detected (bright-saturated pixels ${(glare.frac * 100).toFixed(1)}% > ${(TUNING.glareMaxFrac * 100).toFixed(1)}%).` });
@@ -521,12 +531,27 @@ async function gradeCardFrontOpenCV(file: File): Promise<{ result: GradeResult; 
       }
     };
 
-    overlay = drawOverlay(cv, rectified, centering ?? null, flawRes);
-    const rectifiedPNG = await matToDataUrl(cv, rectified);
-    const overlayPNG = await matToDataUrl(cv, overlay);
+    const rectifiedCanvas = canvasFromImageData(rectifiedImageData);
+    const overlayCanvas = createProcessingCanvas(rectifiedWidth, rectifiedHeight);
+    const overlayCtx = overlayCanvas.getContext('2d');
+    if (!overlayCtx) throw new Error('Canvas 2D not available');
+
+    renderMeasurementOverlay(
+      overlayCtx,
+      rectifiedWidth,
+      rectifiedHeight,
+      rectifiedCanvas as CanvasImageSource,
+      rectifiedCardBounds,
+      innerBounds,
+      centering ?? null,
+      result,
+      'opencv_perspective'
+    );
+
+    const rectifiedPNG = await Promise.resolve(canvasToPngDataUrl(rectifiedCanvas));
+    const overlayPNG = await Promise.resolve(canvasToPngDataUrl(overlayCanvas));
     return { result, overlayPNG, rectifiedPNG };
   } finally {
-    if (overlay) overlay.delete();
     if (rectified) rectified.delete();
     img.delete();
   }
@@ -719,6 +744,7 @@ async function analyzeCardFrontCanvasFallback(
     normalizedProfileBounds,
     normalizedThresholdBounds,
     autoCardBounds,
+    standardsSource: STANDARDS_SOURCE_DOCUMENTS,
     manualGuideOverride,
     manualGuideBounds,
     manualGuideOverrideApplied: !!manualGuideBounds,
@@ -776,7 +802,7 @@ async function analyzeCardFrontCanvasFallback(
         confidence: qualityAssessment.imageQualityScore,
         assumptions: [
           'Front image only.',
-          'Standard card size assumed as 6.4cm x 8.9cm when converting normalized pixel distances.',
+          'Standard card size assumed as 6.35cm x 8.89cm using the conditioning standards overlay reference.',
           'Preview mode estimates centering and observability only; visible defect scoring is deferred until grading.'
         ],
         limitations: [
@@ -864,7 +890,7 @@ async function analyzeCardFrontCanvasFallback(
       confidence,
       assumptions: [
         'Front image only.',
-        'Standard card size assumed as 6.4cm x 8.9cm for normalized conversions.',
+        'Standard card size assumed as 6.35cm x 8.89cm using the conditioning standards overlay reference.',
         'Visible defect thresholds are heuristic proxies derived from the supplied rubric.'
       ],
       limitations: [
@@ -903,6 +929,7 @@ async function analyzeCardFrontCanvasFallback(
     overlayCtx,
     normalizedWidth,
     normalizedHeight,
+    normalizedCanvas as CanvasImageSource,
     normalizedCardBounds,
     innerBounds,
     overlayCentering,
@@ -1112,15 +1139,21 @@ function renderMeasurementOverlay(
   ctx: OverlayContext2D,
   width: number,
   height: number,
+  baseImage: CanvasImageSource | null,
   cardBounds: ContentBounds,
   innerBounds: ContentBounds | null,
-  centering: CenteringResult,
+  centering: CenteringResult | null,
   result: GradeResult,
   normalizationMethod: 'opencv_perspective' | 'crop_scale'
 ): void {
   ctx.clearRect(0, 0, width, height);
+  if (baseImage) {
+    ctx.drawImage(baseImage, 0, 0, width, height);
+  }
 
+  applyFindingNegativeHighlights(ctx, result);
   drawOutsideCardShade(ctx, width, height, cardBounds);
+  const standardsGeometry = buildConditioningOverlayGeometry(cardBounds, innerBounds);
 
   if (innerBounds) {
     drawMeasurementBand(ctx, cardBounds.minX, cardBounds.minY, innerBounds.minX - cardBounds.minX, cardBounds.maxY - cardBounds.minY + 1, 'rgba(153, 246, 96, 0.10)');
@@ -1128,6 +1161,8 @@ function renderMeasurementOverlay(
     drawMeasurementBand(ctx, cardBounds.minX, cardBounds.minY, cardBounds.maxX - cardBounds.minX + 1, innerBounds.minY - cardBounds.minY, 'rgba(244, 114, 182, 0.10)');
     drawMeasurementBand(ctx, cardBounds.minX, innerBounds.maxY + 1, cardBounds.maxX - cardBounds.minX + 1, cardBounds.maxY - innerBounds.maxY, 'rgba(251, 191, 36, 0.10)');
   }
+
+  drawStandardsMeasurementZones(ctx, standardsGeometry);
 
   drawGuidePair(ctx, width, height, {
     axis: 'x',
@@ -1182,6 +1217,35 @@ function drawMeasurementBand(ctx: OverlayContext2D, x: number, y: number, w: num
   ctx.save();
   ctx.fillStyle = fill;
   ctx.fillRect(x, y, w, h);
+  ctx.restore();
+}
+
+function drawStandardsMeasurementZones(
+  ctx: OverlayContext2D,
+  geometry: ReturnType<typeof buildConditioningOverlayGeometry>
+): void {
+  for (const zone of geometry.cornerZones) {
+    drawStandardsZone(ctx, zone.bounds, 'rgba(250, 204, 21, 0.90)', 'rgba(250, 204, 21, 0.10)', [6, 4]);
+  }
+  drawStandardsZone(ctx, geometry.surfaceZone.bounds, 'rgba(248, 250, 252, 0.88)', 'rgba(248, 250, 252, 0.05)', [10, 6]);
+}
+
+function drawStandardsZone(
+  ctx: OverlayContext2D,
+  bounds: ContentBounds,
+  stroke: string,
+  fill: string,
+  dash: number[]
+): void {
+  const width = Math.max(1, bounds.maxX - bounds.minX + 1);
+  const height = Math.max(1, bounds.maxY - bounds.minY + 1);
+  ctx.save();
+  ctx.fillStyle = fill;
+  ctx.fillRect(bounds.minX, bounds.minY, width, height);
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 1.25;
+  ctx.setLineDash(dash);
+  ctx.strokeRect(bounds.minX + 0.5, bounds.minY + 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
   ctx.restore();
 }
 
@@ -1299,21 +1363,14 @@ function drawCenterCrosshair(ctx: OverlayContext2D, cardBounds: ContentBounds): 
 function drawCenteringSummary(
   ctx: OverlayContext2D,
   cardBounds: ContentBounds,
-  centering: CenteringResult,
+  centering: CenteringResult | null,
   result: GradeResult,
   normalizationMethod: 'opencv_perspective' | 'crop_scale'
 ): void {
-  const cardWidthPx = Math.max(1, cardBounds.maxX - cardBounds.minX + 1);
-  const cardHeightPx = Math.max(1, cardBounds.maxY - cardBounds.minY + 1);
-  const leftMm = pxToMillimeters(centering.debug.border.leftPx, cardWidthPx, TUNING.cardWidthCm * 10);
-  const rightMm = pxToMillimeters(centering.debug.border.rightPx, cardWidthPx, TUNING.cardWidthCm * 10);
-  const topMm = pxToMillimeters(centering.debug.border.topPx, cardHeightPx, TUNING.cardHeightCm * 10);
-  const bottomMm = pxToMillimeters(centering.debug.border.bottomPx, cardHeightPx, TUNING.cardHeightCm * 10);
-
   const boxX = clampInt(cardBounds.minX + 12, 8, Math.max(8, cardBounds.maxX - 280));
-  const boxY = clampInt(cardBounds.minY + 12, 8, Math.max(8, cardBounds.maxY - 128));
+  const boxY = clampInt(cardBounds.minY + 12, 8, Math.max(8, cardBounds.maxY - 104));
   const boxW = Math.min(272, Math.max(180, cardBounds.maxX - cardBounds.minX - 24));
-  const boxH = 120;
+  const boxH = centering ? 120 : 96;
   const flawPoints = result.flaws?.effectivePoints ?? result.flaws?.totalPoints ?? 0;
   const confidence = result.final.confidence;
   const majorIssues = result.report?.topReasons?.slice(0, 2)?.join(' | ') ?? 'No major issues above threshold.';
@@ -1324,63 +1381,389 @@ function drawCenteringSummary(
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
   ctx.strokeRect(boxX + 0.5, boxY + 0.5, boxW - 1, boxH - 1);
 
-  ctx.font = '600 12px sans-serif';
-  ctx.fillStyle = '#f4f4f5';
-  ctx.fillText(`Centering ${centering.lr.ratio} / ${centering.tb.ratio}`, boxX + 10, boxY + 18);
+  if (centering) {
+    const cardWidthPx = Math.max(1, cardBounds.maxX - cardBounds.minX + 1);
+    const cardHeightPx = Math.max(1, cardBounds.maxY - cardBounds.minY + 1);
+    const leftMm = pxToCardWidthMillimeters(centering.debug.border.leftPx, cardWidthPx);
+    const rightMm = pxToCardWidthMillimeters(centering.debug.border.rightPx, cardWidthPx);
+    const topMm = pxToCardHeightMillimeters(centering.debug.border.topPx, cardHeightPx);
+    const bottomMm = pxToCardHeightMillimeters(centering.debug.border.bottomPx, cardHeightPx);
 
-  ctx.font = '12px sans-serif';
-  ctx.fillStyle = 'rgba(244, 244, 245, 0.92)';
-  ctx.fillText(
-    `L/R ${leftMm.toFixed(1)}mm / ${rightMm.toFixed(1)}mm  (${Math.round(centering.debug.border.leftPct)}% / ${Math.round(centering.debug.border.rightPct)}%)`,
-    boxX + 10,
-    boxY + 38
-  );
-  ctx.fillText(
-    `T/B ${topMm.toFixed(1)}mm / ${bottomMm.toFixed(1)}mm  (${Math.round(centering.debug.border.topPct)}% / ${Math.round(centering.debug.border.bottomPct)}%)`,
-    boxX + 10,
-    boxY + 56
-  );
+    ctx.font = '600 12px sans-serif';
+    ctx.fillStyle = '#f4f4f5';
+    ctx.fillText(`Centering ${centering.lr.ratio} / ${centering.tb.ratio}`, boxX + 10, boxY + 18);
 
-  ctx.fillStyle = 'rgba(212, 212, 216, 0.85)';
-  ctx.fillText(`Grade ${result.final.gradeLabel}  |  Flaw pts ${flawPoints}  |  ${normalizationMethod}`, boxX + 10, boxY + 74);
-  ctx.fillText(`Confidence ${confidence.toFixed(2)}  |  Review ${result.report?.manualReviewRequired ? 'YES' : 'NO'}`, boxX + 10, boxY + 92);
-  ctx.font = '11px sans-serif';
-  wrapOverlayText(ctx, `Issues: ${majorIssues}`, boxX + 10, boxY + 108, boxW - 18, 12, 2);
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = 'rgba(244, 244, 245, 0.92)';
+    ctx.fillText(
+      `L/R ${leftMm.toFixed(1)}mm / ${rightMm.toFixed(1)}mm  (${Math.round(centering.debug.border.leftPct)}% / ${Math.round(centering.debug.border.rightPct)}%)`,
+      boxX + 10,
+      boxY + 38
+    );
+    ctx.fillText(
+      `T/B ${topMm.toFixed(1)}mm / ${bottomMm.toFixed(1)}mm  (${Math.round(centering.debug.border.topPct)}% / ${Math.round(centering.debug.border.bottomPct)}%)`,
+      boxX + 10,
+      boxY + 56
+    );
+
+    ctx.fillStyle = 'rgba(212, 212, 216, 0.85)';
+    ctx.fillText(`Grade ${result.final.gradeLabel}  |  Flaw pts ${flawPoints}  |  ${normalizationMethod}`, boxX + 10, boxY + 74);
+    ctx.fillText(`Confidence ${confidence.toFixed(2)}  |  Review ${result.report?.manualReviewRequired ? 'YES' : 'NO'}`, boxX + 10, boxY + 92);
+    ctx.font = '11px sans-serif';
+    wrapOverlayText(ctx, `Issues: ${majorIssues}`, boxX + 10, boxY + 108, boxW - 18, 12, 2);
+  } else {
+    ctx.font = '600 12px sans-serif';
+    ctx.fillStyle = '#f4f4f5';
+    ctx.fillText('Centering unavailable for this pass', boxX + 10, boxY + 20);
+
+    ctx.font = '12px sans-serif';
+    ctx.fillStyle = 'rgba(212, 212, 216, 0.9)';
+    ctx.fillText(`Grade ${result.final.gradeLabel}  |  Flaw pts ${flawPoints}  |  ${normalizationMethod}`, boxX + 10, boxY + 42);
+    ctx.fillText(`Confidence ${confidence.toFixed(2)}  |  Review ${result.report?.manualReviewRequired ? 'YES' : 'NO'}`, boxX + 10, boxY + 60);
+    ctx.font = '11px sans-serif';
+    wrapOverlayText(ctx, `Issues: ${majorIssues}`, boxX + 10, boxY + 78, boxW - 18, 12, 2);
+  }
+
   ctx.restore();
 }
 
-function drawFindingHighlights(ctx: OverlayContext2D, result: GradeResult): void {
-  const findings = (result.report?.detectedDefects ?? [])
+function getRenderableFindingHighlights(result: GradeResult): DetectedFinding[] {
+  return (result.report?.detectedDefects ?? [])
     .filter((finding) => finding.observability === 'observed' && finding.region)
     .sort((a, b) => findingSeverityRank(b.severity) - findingSeverityRank(a.severity))
     .slice(0, 6);
+}
+
+type FindingHighlightPalette = {
+  stroke: string;
+  tint: string;
+  glow: string;
+};
+
+type HighlightAnchor = 'center' | 'left' | 'right' | 'top' | 'bottom' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+type HighlightRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+function getFindingHighlightPalette(severity: FindingSeverity): FindingHighlightPalette {
+  switch (severity) {
+    case 'major':
+      return {
+        stroke: 'rgba(239, 68, 68, 0.96)',
+        tint: 'rgba(254, 226, 226, 0.18)',
+        glow: 'rgba(239, 68, 68, 0.40)'
+      };
+    case 'moderate':
+      return {
+        stroke: 'rgba(249, 115, 22, 0.96)',
+        tint: 'rgba(255, 237, 213, 0.18)',
+        glow: 'rgba(249, 115, 22, 0.36)'
+      };
+    case 'minor':
+      return {
+        stroke: 'rgba(245, 158, 11, 0.96)',
+        tint: 'rgba(254, 243, 199, 0.16)',
+        glow: 'rgba(245, 158, 11, 0.30)'
+      };
+    default:
+      return {
+        stroke: 'rgba(250, 204, 21, 0.92)',
+        tint: 'rgba(254, 249, 195, 0.14)',
+        glow: 'rgba(250, 204, 21, 0.28)'
+      };
+  }
+}
+
+function applyFindingNegativeHighlights(ctx: OverlayContext2D, result: GradeResult): void {
+  for (const finding of getRenderableFindingHighlights(result)) {
+    if (!finding.region) continue;
+    const palette = getFindingHighlightPalette(finding.severity);
+    const region = expandFindingHighlightRect(finding.region, ctx.canvas.width, ctx.canvas.height, 2);
+
+    ctx.save();
+    traceFindingHighlightPath(ctx, finding, region);
+    ctx.clip();
+
+    // Drawing white in difference mode creates a localized negative of the underlying defect texture.
+    ctx.globalCompositeOperation = 'difference';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(region.x, region.y, region.w, region.h);
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = palette.tint;
+    ctx.fillRect(region.x, region.y, region.w, region.h);
+    ctx.restore();
+  }
+}
+
+function drawFindingHighlights(ctx: OverlayContext2D, result: GradeResult): void {
+  const findings = getRenderableFindingHighlights(result);
 
   findings.forEach((finding) => {
     if (!finding.region) return;
-    const color = finding.severity === 'major'
-      ? 'rgba(239, 68, 68, 0.95)'
-      : finding.severity === 'moderate'
-        ? 'rgba(249, 115, 22, 0.95)'
-        : finding.severity === 'minor'
-          ? 'rgba(245, 158, 11, 0.95)'
-          : 'rgba(250, 204, 21, 0.95)';
+    const palette = getFindingHighlightPalette(finding.severity);
+    const region = expandFindingHighlightRect(finding.region, ctx.canvas.width, ctx.canvas.height, 2);
+
     ctx.save();
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color.replace('0.95', '0.12');
-    ctx.lineWidth = 2;
-    ctx.fillRect(finding.region.x, finding.region.y, finding.region.w, finding.region.h);
-    ctx.strokeRect(finding.region.x + 0.5, finding.region.y + 0.5, finding.region.w - 1, finding.region.h - 1);
+    traceFindingHighlightPath(ctx, finding, region);
+    ctx.strokeStyle = palette.glow;
+    ctx.lineWidth = 5;
+    ctx.stroke();
+
+    traceFindingHighlightPath(ctx, finding, region);
+    ctx.strokeStyle = palette.stroke;
+    ctx.lineWidth = 2.25;
+    ctx.stroke();
+
+    traceFindingHighlightPath(ctx, finding, region);
+    ctx.strokeStyle = 'rgba(248, 250, 252, 0.68)';
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+
     ctx.font = '600 11px sans-serif';
     const label = `${finding.flawType} (${finding.severity})`;
-    const labelWidth = Math.min(Math.max(76, ctx.measureText(label).width + 10), 180);
-    const labelX = clampInt(finding.region.x, 2, Math.max(2, finding.region.x + finding.region.w - labelWidth));
-    const labelY = clampInt(finding.region.y - 16, 2, Math.max(2, finding.region.y));
-    ctx.fillStyle = 'rgba(17, 24, 39, 0.82)';
+    const labelWidth = Math.min(Math.max(92, ctx.measureText(label).width + 12), 190);
+    const labelX = clampInt(region.x, 2, Math.max(2, ctx.canvas.width - labelWidth - 2));
+    const preferredLabelY = region.y > 24 ? region.y - 18 : region.y + region.h + 4;
+    const labelY = clampInt(preferredLabelY, 2, Math.max(2, ctx.canvas.height - 16));
+    const calloutX = clampFloat(region.x + (region.w * 0.5), 2, Math.max(2, ctx.canvas.width - 2));
+    const calloutY = labelY < region.y ? labelY + 14 : labelY;
+    const targetY = labelY < region.y ? region.y : region.y + region.h;
+
+    ctx.beginPath();
+    ctx.moveTo(calloutX, calloutY);
+    ctx.lineTo(calloutX, targetY);
+    ctx.strokeStyle = 'rgba(15, 23, 42, 0.72)';
+    ctx.lineWidth = 1.1;
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(17, 24, 39, 0.86)';
     ctx.fillRect(labelX, labelY, labelWidth, 14);
+    ctx.strokeStyle = palette.stroke;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(labelX + 0.5, labelY + 0.5, labelWidth - 1, 13);
     ctx.fillStyle = '#f8fafc';
-    ctx.fillText(label, labelX + 5, labelY + 10);
+    ctx.fillText(label, labelX + 6, labelY + 10);
     ctx.restore();
   });
+}
+
+function expandFindingHighlightRect(region: FindingRegion, canvasWidth: number, canvasHeight: number, paddingPx: number): HighlightRect {
+  const x = clampFloat(region.x - paddingPx, 0, Math.max(0, canvasWidth - 1));
+  const y = clampFloat(region.y - paddingPx, 0, Math.max(0, canvasHeight - 1));
+  const maxX = clampFloat(region.x + region.w + paddingPx, x + 1, Math.max(1, canvasWidth));
+  const maxY = clampFloat(region.y + region.h + paddingPx, y + 1, Math.max(1, canvasHeight));
+  return {
+    x,
+    y,
+    w: Math.max(1, maxX - x),
+    h: Math.max(1, maxY - y)
+  };
+}
+
+function inferFindingAnchor(region: FindingRegion): HighlightAnchor {
+  const centerX = region.normalized.x + (region.normalized.w * 0.5);
+  const centerY = region.normalized.y + (region.normalized.h * 0.5);
+  const horizontal = centerX < 0.33 ? 'left' : centerX > 0.67 ? 'right' : 'center';
+  const vertical = centerY < 0.33 ? 'top' : centerY > 0.67 ? 'bottom' : 'center';
+  if (horizontal === 'center' && vertical === 'center') return 'center';
+  if (horizontal === 'center') return vertical;
+  if (vertical === 'center') return horizontal;
+  return `${vertical}-${horizontal}` as HighlightAnchor;
+}
+
+function inferFindingSide(finding: DetectedFinding): 'left' | 'right' | 'top' | 'bottom' | 'multiple' {
+  const location = finding.location.toLowerCase();
+  const explicitSides = ['left', 'right', 'top', 'bottom'].filter((token) => location.includes(token));
+  if (location.includes('+') || location.includes('multiple') || location.includes('perimeter') || explicitSides.length > 1) {
+    return 'multiple';
+  }
+  if (explicitSides.length === 1) {
+    return explicitSides[0] as 'left' | 'right' | 'top' | 'bottom';
+  }
+  const anchor = finding.region ? inferFindingAnchor(finding.region) : 'center';
+  switch (anchor) {
+    case 'left':
+    case 'right':
+    case 'top':
+    case 'bottom':
+      return anchor;
+    case 'top-left':
+    case 'bottom-left':
+      return 'left';
+    case 'top-right':
+    case 'bottom-right':
+      return 'right';
+    default:
+      return 'multiple';
+  }
+}
+
+function inferFindingCorner(finding: DetectedFinding): 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'multiple' {
+  const location = finding.location.toLowerCase();
+  if (location.includes('top-left')) return 'top-left';
+  if (location.includes('top-right')) return 'top-right';
+  if (location.includes('bottom-left')) return 'bottom-left';
+  if (location.includes('bottom-right')) return 'bottom-right';
+  if (location.includes('multiple') || /\b\d+\s+corners\b/.test(location)) return 'multiple';
+  const anchor = finding.region ? inferFindingAnchor(finding.region) : 'center';
+  if (anchor === 'top-left' || anchor === 'top-right' || anchor === 'bottom-left' || anchor === 'bottom-right') {
+    return anchor;
+  }
+  return 'multiple';
+}
+
+function traceFindingHighlightPath(ctx: OverlayContext2D, finding: DetectedFinding, region: HighlightRect): void {
+  const flawType = finding.flawType.toLowerCase();
+  if (flawType.includes('scratch')) {
+    traceScratchHighlightPath(ctx, region);
+    return;
+  }
+  if (flawType.includes('corner')) {
+    traceCornerHighlightPath(ctx, region, inferFindingCorner(finding));
+    return;
+  }
+  if (flawType.includes('edge') || flawType.includes('perimeter')) {
+    traceEdgeHighlightPath(ctx, region, inferFindingSide(finding));
+    return;
+  }
+  if (flawType.includes('scuff') || flawType.includes('surface')) {
+    traceSurfaceHighlightPath(ctx, region);
+    return;
+  }
+  traceRoundedRectPath(ctx, region.x, region.y, region.w, region.h, Math.min(region.w, region.h) * 0.22);
+}
+
+function traceScratchHighlightPath(ctx: OverlayContext2D, region: HighlightRect): void {
+  const horizontal = region.w >= region.h;
+  if (horizontal) {
+    const bandHeight = Math.max(4, region.h * 0.36);
+    traceRoundedRectPath(
+      ctx,
+      region.x + (region.w * 0.04),
+      region.y + ((region.h - bandHeight) * 0.5),
+      Math.max(6, region.w * 0.92),
+      bandHeight,
+      Math.min(10, bandHeight * 0.6)
+    );
+    return;
+  }
+
+  const bandWidth = Math.max(4, region.w * 0.36);
+  traceRoundedRectPath(
+    ctx,
+    region.x + ((region.w - bandWidth) * 0.5),
+    region.y + (region.h * 0.04),
+    bandWidth,
+    Math.max(6, region.h * 0.92),
+    Math.min(10, bandWidth * 0.6)
+  );
+}
+
+function traceSurfaceHighlightPath(ctx: OverlayContext2D, region: HighlightRect): void {
+  ctx.beginPath();
+  ctx.ellipse(region.x + (region.w * 0.5), region.y + (region.h * 0.52), Math.max(4, region.w * 0.36), Math.max(4, region.h * 0.3), -0.18, 0, Math.PI * 2);
+  ctx.ellipse(region.x + (region.w * 0.28), region.y + (region.h * 0.48), Math.max(2, region.w * 0.14), Math.max(2, region.h * 0.14), 0.42, 0, Math.PI * 2);
+  ctx.ellipse(region.x + (region.w * 0.72), region.y + (region.h * 0.42), Math.max(2, region.w * 0.11), Math.max(2, region.h * 0.11), -0.48, 0, Math.PI * 2);
+}
+
+function traceEdgeHighlightPath(
+  ctx: OverlayContext2D,
+  region: HighlightRect,
+  side: 'left' | 'right' | 'top' | 'bottom' | 'multiple'
+): void {
+  const radius = Math.min(10, Math.min(region.w, region.h) * 0.24);
+  switch (side) {
+    case 'left': {
+      const bandWidth = Math.max(6, Math.min(region.w, region.w * 0.48));
+      traceRoundedRectPath(ctx, region.x, region.y + (region.h * 0.05), bandWidth, Math.max(8, region.h * 0.9), radius);
+      return;
+    }
+    case 'right': {
+      const bandWidth = Math.max(6, Math.min(region.w, region.w * 0.48));
+      traceRoundedRectPath(ctx, region.x + region.w - bandWidth, region.y + (region.h * 0.05), bandWidth, Math.max(8, region.h * 0.9), radius);
+      return;
+    }
+    case 'top': {
+      const bandHeight = Math.max(6, Math.min(region.h, region.h * 0.48));
+      traceRoundedRectPath(ctx, region.x + (region.w * 0.05), region.y, Math.max(8, region.w * 0.9), bandHeight, radius);
+      return;
+    }
+    case 'bottom': {
+      const bandHeight = Math.max(6, Math.min(region.h, region.h * 0.48));
+      traceRoundedRectPath(ctx, region.x + (region.w * 0.05), region.y + region.h - bandHeight, Math.max(8, region.w * 0.9), bandHeight, radius);
+      return;
+    }
+    default:
+      traceRoundedRectPath(ctx, region.x + (region.w * 0.04), region.y + (region.h * 0.04), region.w * 0.92, region.h * 0.92, radius);
+  }
+}
+
+function traceCornerHighlightPath(
+  ctx: OverlayContext2D,
+  region: HighlightRect,
+  corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'multiple'
+): void {
+  const x = region.x;
+  const y = region.y;
+  const w = region.w;
+  const h = region.h;
+  ctx.beginPath();
+
+  switch (corner) {
+    case 'top-left':
+      ctx.moveTo(x, y + (h * 0.88));
+      ctx.lineTo(x, y);
+      ctx.lineTo(x + (w * 0.88), y);
+      ctx.quadraticCurveTo(x + (w * 0.22), y + (h * 0.22), x, y + (h * 0.88));
+      ctx.closePath();
+      return;
+    case 'top-right':
+      ctx.moveTo(x + (w * 0.12), y);
+      ctx.lineTo(x + w, y);
+      ctx.lineTo(x + w, y + (h * 0.88));
+      ctx.quadraticCurveTo(x + (w * 0.78), y + (h * 0.22), x + (w * 0.12), y);
+      ctx.closePath();
+      return;
+    case 'bottom-left':
+      ctx.moveTo(x, y + (h * 0.12));
+      ctx.lineTo(x, y + h);
+      ctx.lineTo(x + (w * 0.88), y + h);
+      ctx.quadraticCurveTo(x + (w * 0.22), y + (h * 0.78), x, y + (h * 0.12));
+      ctx.closePath();
+      return;
+    case 'bottom-right':
+      ctx.moveTo(x + w, y + (h * 0.12));
+      ctx.lineTo(x + w, y + h);
+      ctx.lineTo(x + (w * 0.12), y + h);
+      ctx.quadraticCurveTo(x + (w * 0.78), y + (h * 0.78), x + w, y + (h * 0.12));
+      ctx.closePath();
+      return;
+    default:
+      traceRoundedRectPath(ctx, x + (w * 0.05), y + (h * 0.05), w * 0.9, h * 0.9, Math.min(w, h) * 0.18);
+  }
+}
+
+function traceRoundedRectPath(ctx: OverlayContext2D, x: number, y: number, w: number, h: number, radius: number): void {
+  const safeWidth = Math.max(1, w);
+  const safeHeight = Math.max(1, h);
+  const safeRadius = Math.max(0, Math.min(radius, safeWidth * 0.5, safeHeight * 0.5));
+
+  ctx.beginPath();
+  ctx.moveTo(x + safeRadius, y);
+  ctx.lineTo(x + safeWidth - safeRadius, y);
+  ctx.quadraticCurveTo(x + safeWidth, y, x + safeWidth, y + safeRadius);
+  ctx.lineTo(x + safeWidth, y + safeHeight - safeRadius);
+  ctx.quadraticCurveTo(x + safeWidth, y + safeHeight, x + safeWidth - safeRadius, y + safeHeight);
+  ctx.lineTo(x + safeRadius, y + safeHeight);
+  ctx.quadraticCurveTo(x, y + safeHeight, x, y + safeHeight - safeRadius);
+  ctx.lineTo(x, y + safeRadius);
+  ctx.quadraticCurveTo(x, y, x + safeRadius, y);
+  ctx.closePath();
 }
 
 function wrapOverlayText(
@@ -2526,8 +2909,8 @@ export function buildCanvasCentering(
   const card = cardBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
   const cardW = Math.max(1, card.maxX - card.minX + 1);
   const cardH = Math.max(1, card.maxY - card.minY + 1);
-  const defaultInsetX = Math.max(1, Math.round(cardW * 0.08));
-  const defaultInsetY = Math.max(1, Math.round(cardH * 0.08));
+  const defaultInsetX = mmToCardWidthPx(CONDITIONING_OVERLAY_SPEC.defaultInnerInsetMm.x, cardW);
+  const defaultInsetY = mmToCardHeightPx(CONDITIONING_OVERLAY_SPEC.defaultInnerInsetMm.y, cardH);
 
   const rawInner = innerBounds ?? {
     minX: card.minX + defaultInsetX,
@@ -2844,7 +3227,7 @@ function formatLengthCm(value: number): string {
 }
 
 function formatAreaCm2(value: number): string {
-  return `${value.toFixed(2)}cm²`;
+  return `${value.toFixed(2)}cm^2`;
 }
 
 function confidenceBandFromScore(confidence: number): 'low' | 'medium' | 'high' {
@@ -3015,19 +3398,20 @@ export function detectCanvasPsaStyleFlaws(
   const stats = computeLumaStats(px, width, height);
   const items: FlawItem[] = [];
   const detectedFindings: DetectedFinding[] = [];
+  const measurementBounds = bounds ?? innerBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
+  const standardsGeometry = buildConditioningOverlayGeometry(measurementBounds, innerBounds);
   const borderRoughness = estimateBorderRoughness(px, width, height, bounds);
   const borderStats = analyzeCanvasBorderCleanliness(px, width, height, bounds, innerBounds);
   const wearStats = analyzeCanvasWear(px, width, height, bounds, innerBounds);
-  const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, innerBounds ?? bounds);
+  const interiorStats = analyzeCanvasInteriorDisturbance(px, width, height, bounds, innerBounds);
   const toneBands = analyzeCanvasToneBands(px, width, height, bounds, innerBounds);
   const borderHotspots = detectBorderHotspots(px, width, height, bounds, innerBounds);
   const cornerHotspots = detectCornerHotspots(px, width, height, bounds, innerBounds);
-  const measurementBounds = bounds ?? innerBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
   const cardWidthPx = Math.max(1, measurementBounds.maxX - measurementBounds.minX + 1);
   const cardHeightPx = Math.max(1, measurementBounds.maxY - measurementBounds.minY + 1);
   const cardAreaCm2 = TUNING.cardWidthCm * TUNING.cardHeightCm;
   const cardPerimeterCm = 2 * (TUNING.cardWidthCm + TUNING.cardHeightCm);
-  const interiorRegion = innerBounds ?? bounds ?? measurementBounds;
+  const interiorRegion = standardsGeometry.surfaceZone.bounds;
   const scratchHotspots = interiorStats.hotspots.filter((hotspot) => hotspot.kind === 'scratch');
   const scuffHotspots = interiorStats.hotspots.filter((hotspot) => hotspot.kind === 'scuffing');
   const scratchLengthPx = totalInteriorHotspotLengthPx(scratchHotspots);
@@ -3821,9 +4205,10 @@ function detectBorderHotspots(
     maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
     maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
   };
+  const standardsGeometry = buildConditioningOverlayGeometry(card, inner);
   const step = Math.max(1, Math.floor(Math.min(width, height) / 760));
   const hotspots: BorderHotspot[] = [];
-  const segmentSpan = Math.max(14, Math.round(Math.min(width, height) * 0.045));
+  const segmentSpan = Math.max(10, standardsGeometry.metrics.borderSegmentSpanPx);
 
   const pushSegments = (
     side: BorderHotspot['side'],
@@ -3878,18 +4263,21 @@ function analyzeCanvasInteriorDisturbance(
   px: Uint8ClampedArray,
   width: number,
   height: number,
-  bounds: ContentBounds | null
+  bounds: ContentBounds | null,
+  innerBounds: ContentBounds | null
 ): {
   anomalyPerK: number;
   strongPerK: number;
   linearPerK: number;
   hotspots: InteriorHotspot[];
 } {
-  if (!bounds) {
+  if (!bounds && !innerBounds) {
     return { anomalyPerK: 0, strongPerK: 0, linearPerK: 0, hotspots: [] };
   }
 
-  const region = insetBoundsByFrac(bounds, width, height, 0.05);
+  const measurementBounds = bounds ?? innerBounds ?? { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 };
+  const standardsGeometry = buildConditioningOverlayGeometry(measurementBounds, innerBounds);
+  const region = standardsGeometry.surfaceZone.bounds;
   const regionWidth = Math.max(1, region.maxX - region.minX + 1);
   const regionHeight = Math.max(1, region.maxY - region.minY + 1);
   if (regionWidth < 12 || regionHeight < 12) {
@@ -4278,6 +4666,7 @@ function analyzeCanvasWear(
     maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
     maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
   };
+  const standardsGeometry = buildConditioningOverlayGeometry(card, inner);
 
   const edgeDeltas: number[] = [];
   const cornerDeltas: number[] = [];
@@ -4299,7 +4688,13 @@ function analyzeCanvasWear(
     const alongSpan = alongMax - alongMin + 1;
     const edgeDepth = clampInt(Math.round(borderThickness * 0.34), 1, Math.max(1, borderThickness - 1));
     const referenceOffset = clampInt(Math.round(borderThickness * 0.42), 2, Math.max(2, borderThickness - 1));
-    const cornerZone = clampInt(Math.round(alongSpan * 0.12), 6, Math.max(6, Math.round(alongSpan * 0.18)));
+    const cornerZone = clampInt(
+      side === 'left' || side === 'right'
+        ? standardsGeometry.metrics.cornerHeightPx
+        : standardsGeometry.metrics.cornerWidthPx,
+      6,
+      Math.max(6, alongSpan - 1)
+    );
 
     for (let along = alongMin; along <= alongMax; along += step) {
       const inCornerZone = along - alongMin <= cornerZone || alongMax - along <= cornerZone;
@@ -4348,8 +4743,9 @@ function detectCornerHotspots(
     maxX: clampInt(innerBounds.maxX, card.minX, card.maxX),
     maxY: clampInt(innerBounds.maxY, card.minY, card.maxY)
   };
-  const spanX = Math.max(6, Math.round((card.maxX - card.minX + 1) * 0.12));
-  const spanY = Math.max(6, Math.round((card.maxY - card.minY + 1) * 0.12));
+  const standardsGeometry = buildConditioningOverlayGeometry(card, inner);
+  const spanX = Math.max(6, standardsGeometry.metrics.cornerWidthPx - 1);
+  const spanY = Math.max(6, standardsGeometry.metrics.cornerHeightPx - 1);
   const referenceDepthX = clampInt(Math.max(2, Math.round((inner.minX - card.minX) * 0.55)), 2, Math.max(2, inner.minX - card.minX));
   const referenceDepthY = clampInt(Math.max(2, Math.round((inner.minY - card.minY) * 0.55)), 2, Math.max(2, inner.minY - card.minY));
   const step = Math.max(1, Math.floor(Math.min(width, height) / 480));
@@ -5009,6 +5405,14 @@ async function matToDataUrl(cv: any, mat: any): Promise<string> {
   ctx.putImageData(imageData, 0, 0);
   out.delete();
   return await canvasToPngDataUrl(canvas);
+}
+
+function canvasFromImageData(imageData: ImageData): ProcessingCanvas {
+  const canvas = createProcessingCanvas(imageData.width, imageData.height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D not available');
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
 }
 
 // =========================

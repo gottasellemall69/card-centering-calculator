@@ -176,7 +176,18 @@ export async function POST( request: Request ) {
       return NextResponse.json( { ok: false, error: 'OpenAI response did not include structured output text.' }, { status: 502 } );
     }
 
-    const review = JSON.parse( outputText );
+    let review: unknown;
+    try {
+      review = JSON.parse( outputText );
+    } catch {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `OpenAI response was not valid JSON. First 240 chars: ${ truncateText( outputText, 240 ) }`
+        },
+        { status: 502 }
+      );
+    }
     if ( !isAIReviewPayload( review ) ) {
       return NextResponse.json( { ok: false, error: 'OpenAI response did not match the AI review schema.' }, { status: 502 } );
     }
@@ -240,7 +251,7 @@ async function fileToDataUrl(
 
   return {
     ok: true,
-    dataUrl: `data:${ mimeType };base64,${ buffer.toString( 'base64' ) }`
+    dataUrl: `data:${ mimeType};base64,${ buffer.toString( 'base64' ) }`
   };
 }
 
@@ -363,8 +374,11 @@ function buildPrompt( filename: string, result: GradeResult ): string {
 }
 
 function extractOutputText( payload: unknown ): string {
-  const direct = ( payload as { output_text?: unknown; } )?.output_text;
-  if ( typeof direct === 'string' ) return direct;
+  const direct = extractTextCandidate( ( payload as { output_text?: unknown; } )?.output_text );
+  if ( direct ) return direct;
+
+  const parsed = ( payload as { output_parsed?: unknown; } )?.output_parsed;
+  if ( parsed && typeof parsed === 'object' ) return JSON.stringify( parsed );
 
   const output = ( payload as { output?: unknown; } )?.output;
   if ( !Array.isArray( output ) ) return '';
@@ -373,12 +387,39 @@ function extractOutputText( payload: unknown ): string {
     const content = ( item as { content?: unknown; } )?.content;
     if ( !Array.isArray( content ) ) continue;
     for ( const part of content ) {
-      const text = ( part as { text?: unknown; } )?.text;
-      if ( typeof text === 'string' && text.trim() ) return text;
+      const text = extractTextCandidate( ( part as { text?: unknown; } )?.text );
+      if ( text ) return text;
+
+      const json = ( part as { json?: unknown; } )?.json;
+      if ( typeof json === 'string' && json.trim() ) return json.trim();
+      if ( json && typeof json === 'object' ) return JSON.stringify( json );
     }
   }
 
   return '';
+}
+
+function extractTextCandidate( value: unknown ): string {
+  if ( typeof value === 'string' && value.trim() ) return value.trim();
+  if ( Array.isArray( value ) ) {
+    for ( const item of value ) {
+      const extracted = extractTextCandidate( item );
+      if ( extracted ) return extracted;
+    }
+    return '';
+  }
+  if ( value && typeof value === 'object' ) {
+    const record = value as { value?: unknown; text?: unknown; };
+    if ( typeof record.value === 'string' && record.value.trim() ) return record.value.trim();
+    if ( typeof record.text === 'string' && record.text.trim() ) return record.text.trim();
+  }
+  return '';
+}
+
+function truncateText( value: string, maxLen: number ): string {
+  const normalized = value.replace( /\s+/g, ' ' ).trim();
+  if ( normalized.length <= maxLen ) return normalized;
+  return `${ normalized.slice( 0, Math.max( 0, maxLen - 3 ) ) }...`;
 }
 
 async function readOpenAIError( response: Response ): Promise<string> {

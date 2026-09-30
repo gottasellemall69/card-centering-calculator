@@ -19,9 +19,17 @@ import {
   type ManualImageNormalization
 } from '@/lib/manualAlignment';
 import { centeringCapFromWorstSidePct } from '@/lib/rubric';
+import {
+  CONDITIONING_OVERLAY_SPEC,
+  STANDARD_CARD_DIMENSIONS_MM,
+  STANDARDS_SOURCE_DOCUMENTS,
+  buildConditioningOverlayGeometry,
+  mmToCardHeightPx,
+  mmToCardWidthPx
+} from '@/lib/conditioningStandards';
 
-const CARD_WIDTH_MM = 63.5;
-const CARD_HEIGHT_MM = 88.9;
+const CARD_WIDTH_MM = STANDARD_CARD_DIMENSIONS_MM.width;
+const CARD_HEIGHT_MM = STANDARD_CARD_DIMENSIONS_MM.height;
 const MIN_CARD_SPAN_PX = 63.5;
 const MIN_INNER_SPAN_PX = 59.5;
 const MIN_BORDER_PX = 3;
@@ -147,6 +155,7 @@ export function OverlayViewer( {
     ? buildManualCentering( guides.cardBounds, guides.innerBounds, imageSize.w, imageSize.h )
     : null;
   const cardSize = guides ? getBoundsSize( guides.cardBounds ) : null;
+  const standardsGeometry = guides ? buildConditioningOverlayGeometry( guides.cardBounds, guides.innerBounds ) : null;
   const cardTransform = imageSize
     ? buildFittedImageTransform( imageSize, normalization )
     : buildFittedImageTransform( { w: 1, h: 1 }, DEFAULT_MANUAL_IMAGE_NORMALIZATION );
@@ -257,7 +266,9 @@ export function OverlayViewer( {
   return (
     <div className="overlayViewer">
       <div className="overlayViewerToolbar">
-        <div className="small">Use Auto straighten for a starting point, then fine-tune rotate/skew and drag the dotted guides until the card and inner frame sit square.</div>
+        <div className="small">
+          Use Auto straighten for a starting point, then fine-tune rotate/skew and drag the dotted guides until the card and inner frame sit square. The dashed standards windows mirror <code>{STANDARDS_SOURCE_DOCUMENTS.conditioning}</code> and <code>{STANDARDS_SOURCE_DOCUMENTS.overlays}</code>.
+        </div>
         <div className="overlayViewerToolbarActions">
           <button type="button" className="btn btnPrimary" onClick={() => void autoStraighten()} disabled={!guides || !imageSize || isAutoStraightening}>
             {isAutoStraightening ? 'Auto straightening…' : 'Auto straighten'}
@@ -364,6 +375,7 @@ export function OverlayViewer( {
                 <div className="overlayViewerGuides" aria-hidden="true">
                   {renderOutsideShade( guides.cardBounds, imageSize )}
                   {renderMeasurementBands( guides, imageSize )}
+                  {standardsGeometry ? renderStandardsZones( standardsGeometry, imageSize ) : null}
                   {renderGuide(
                     'cardLeft',
                     guides.cardBounds.minX,
@@ -593,6 +605,39 @@ function renderMeasurementBands( guides: GuideState, imageSize: { w: number; h: 
   );
 }
 
+function renderStandardsZones(
+  geometry: ReturnType<typeof buildConditioningOverlayGeometry>,
+  imageSize: { w: number; h: number; }
+) {
+  return (
+    <>
+      {geometry.cornerZones.map( ( zone ) => (
+        <div
+          key={zone.key}
+          className="overlayStandardsZone overlayStandardsCorner"
+          style={boundsToOverlayStyle( zone.bounds, imageSize )}
+        />
+      ) )}
+      <div
+        className="overlayStandardsZone overlayStandardsSurface"
+        style={boundsToOverlayStyle( geometry.surfaceZone.bounds, imageSize )}
+      />
+    </>
+  );
+}
+
+function boundsToOverlayStyle(
+  bounds: { minX: number; minY: number; maxX: number; maxY: number; },
+  imageSize: { w: number; h: number; }
+): CSSProperties {
+  return {
+    left: `${ toXEdgePercent( bounds.minX, imageSize.w ) }%`,
+    top: `${ toYEdgePercent( bounds.minY, imageSize.h ) }%`,
+    width: `${ toSpanPercent( bounds.maxX - bounds.minX + 1, imageSize.w ) }%`,
+    height: `${ toSpanPercent( bounds.maxY - bounds.minY + 1, imageSize.h ) }%`
+  };
+}
+
 function pointerToImageCoordinate(
   clientX: number,
   clientY: number,
@@ -727,8 +772,10 @@ function resolveInitialGuides(
     imageSize.h
   );
 
-  const defaultInsetX = Math.max( 10, Math.round( ( cardBounds.maxX - cardBounds.minX + 1 ) * 0.08 ) );
-  const defaultInsetY = Math.max( 10, Math.round( ( cardBounds.maxY - cardBounds.minY + 1 ) * 0.08 ) );
+  const cardWidth = Math.max( 1, cardBounds.maxX - cardBounds.minX + 1 );
+  const cardHeight = Math.max( 1, cardBounds.maxY - cardBounds.minY + 1 );
+  const defaultInsetX = mmToCardWidthPx( CONDITIONING_OVERLAY_SPEC.defaultInnerInsetMm.x, cardWidth );
+  const defaultInsetY = mmToCardHeightPx( CONDITIONING_OVERLAY_SPEC.defaultInnerInsetMm.y, cardHeight );
   const fallbackInner = {
     minX: cardBounds.minX + defaultInsetX,
     minY: cardBounds.minY + defaultInsetY,

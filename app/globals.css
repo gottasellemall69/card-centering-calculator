@@ -198,6 +198,21 @@ input[type="file"]{color:var(--muted)}
 .overlayBandRight{background:rgba(34,211,238,.12)}
 .overlayBandTop{background:rgba(244,114,182,.12)}
 .overlayBandBottom{background:rgba(251,191,36,.12)}
+.overlayStandardsZone{
+  position:absolute;
+  pointer-events:none;
+  border:1.5px dashed rgba(248,250,252,.82);
+  border-radius:2px;
+  box-shadow:inset 0 0 0 1px rgba(10,15,25,.18);
+}
+.overlayStandardsCorner{
+  background:rgba(250,204,21,.10);
+  border-color:rgba(250,204,21,.78);
+}
+.overlayStandardsSurface{
+  background:rgba(248,250,252,.04);
+  border-color:rgba(248,250,252,.72);
+}
 .overlayGuide{
   position:absolute;
   border:none;

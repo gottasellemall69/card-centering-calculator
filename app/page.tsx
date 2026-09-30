@@ -10,6 +10,7 @@ import { OverlayViewer, type ManualCenteringView } from '@/components/OverlayVie
 import { flattenGradeResult, serializeGradeRowsToCsv } from '@/lib/resultExport';
 import { finalGradeFromCaps } from '@/lib/rubric';
 import type { AIReviewResult } from '@/lib/aiReview';
+import { STANDARD_CARD_DIMENSIONS_MM, STANDARDS_SOURCE_DOCUMENTS } from '@/lib/conditioningStandards';
 
 type RowStatus = 'PENDING' | 'PREPARING' | 'REVIEW' | 'PROCESSING' | 'DONE' | 'ERROR';
 type AIReviewStatus = 'IDLE' | 'REQUESTING' | 'DONE' | 'ERROR';
@@ -615,7 +616,13 @@ export default function Page() {
       });
       const payload = await response.json().catch(() => null) as AIReviewApiResponse | null;
       if (!response.ok || !payload || !payload.ok) {
-        const message = payload && !payload.ok ? payload.error : `AI review failed (${response.status}).`;
+        const contentType = response.headers.get('content-type') ?? '';
+        const missingRoute = response.status === 404 || response.status === 405 || (!payload && contentType.includes('text/html'));
+        const message = payload && !payload.ok
+          ? payload.error
+          : missingRoute
+            ? 'AI review route is unavailable in this deployment. Host the Next.js server with /api/grade-ai enabled and configure OPENAI_API_KEY to use AI review.'
+            : `AI review failed (${response.status}).`;
         throw new Error(message);
       }
 
@@ -963,7 +970,7 @@ export default function Page() {
 
             <div className="row" style={{ alignItems: 'center', justifyContent: 'space-between', marginTop: 12 }}>
               <div className="notice" style={{ flex: '1 1 320px' }}>
-                The current guide positions are the measurement area that will be used for centering when you estimate this image.
+                The current guide positions are the measurement area that will be used for centering when you estimate this image. The dashed standards windows mirror <code>{STANDARDS_SOURCE_DOCUMENTS.conditioning}</code> and <code>{STANDARDS_SOURCE_DOCUMENTS.overlays}</code>.
               </div>
               <div className="row" style={{ gap: 8 }}>
                 {displayedResult ? (
@@ -1081,7 +1088,7 @@ export default function Page() {
               <div className="small">Straighten</div>
               <div>
                 {selected.manualNormalization && !isIdentityNormalization(selected.manualNormalization)
-                  ? `Rotate ${selected.manualNormalization.rotationDeg.toFixed(1)}°, Skew X ${selected.manualNormalization.skewXDeg.toFixed(1)}°, Skew Y ${selected.manualNormalization.skewYDeg.toFixed(1)}°`
+                  ? `Rotate ${selected.manualNormalization.rotationDeg.toFixed(1)} deg, Skew X ${selected.manualNormalization.skewXDeg.toFixed(1)} deg, Skew Y ${selected.manualNormalization.skewYDeg.toFixed(1)} deg`
                   : 'None'}
               </div>
             </div>
@@ -1121,7 +1128,7 @@ export default function Page() {
                   <AIReviewPanel review={selected.aiReview} />
                 ) : (
                   <div className="notice" style={{ marginTop: 10 }}>
-                    Optional AI review is available after local grading. It can flag obvious missed defects or false positives, but the app still uses the deterministic centering and grade-cap math above.
+                    Optional AI review is available after local grading. It can flag obvious missed defects or false positives, but the app still uses the deterministic centering and grade-cap math above. Server-hosted AI review requires <code>/api/grade-ai</code> and <code>OPENAI_API_KEY</code>.
                   </div>
                 )}
 
@@ -1431,8 +1438,8 @@ function EstimateEvidenceModal({
   );
   const methodology = [
     'Outer card bounds are detected from color/profile evidence and normalized to a standard card aspect.',
-    'Inner frame boundaries are detected from border-to-design transitions to compute centering.',
-    'Visible condition findings are measured from border, edge, corner, and interior anomaly signals on the detected card region.',
+    `Inner frame boundaries and standardized review windows follow ${STANDARDS_SOURCE_DOCUMENTS.conditioning} and ${STANDARDS_SOURCE_DOCUMENTS.overlays}.`,
+    'Visible condition findings are measured from border, edge, corner, and interior anomaly signals inside those standardized review zones.',
     'Final estimate uses conservative grade ceilings from centering, visible defects, and image observability.'
   ];
 
@@ -1457,8 +1464,9 @@ function EstimateEvidenceModal({
         <div className="resultModalBody">
           <div className="resultModalImageGrid">
             <figure className="resultModalFigure">
-              <figcaption>Detection + centering evidence overlay</figcaption>
-              <img src={overlaySrc} alt={`${payload.filename} evidence overlay`} loading="lazy" decoding="async" />
+              <figcaption>Evidence overlay with negative-style defect emphasis + centering measurements</figcaption>
+              <img src={overlaySrc} alt={`${payload.filename} evidence overlay with defect emphasis`} loading="lazy" decoding="async" />
+              <div className="small">Highlighted defect zones show localized negative-style emphasis on the exact analysis image used for grading.</div>
             </figure>
             {payload.rectifiedObjectURL ? (
               <figure className="resultModalFigure">
@@ -1504,7 +1512,7 @@ function EstimateEvidenceModal({
               <div className="small">Straighten transform</div>
               <div>
                 {manualNormalization && !isIdentityNormalization(manualNormalization)
-                  ? `Rotate ${manualNormalization.rotationDeg.toFixed(1)}°, Skew X ${manualNormalization.skewXDeg.toFixed(1)}°, Skew Y ${manualNormalization.skewYDeg.toFixed(1)}°`
+                  ? `Rotate ${manualNormalization.rotationDeg.toFixed(1)} deg, Skew X ${manualNormalization.skewXDeg.toFixed(1)} deg, Skew Y ${manualNormalization.skewYDeg.toFixed(1)} deg`
                   : 'None'}
               </div>
             </div>
@@ -1659,9 +1667,9 @@ function deriveCenteringMillimeters(centering: ManualCenteringView | GradeResult
   const cardWidthPx = Math.max(1, centering.debug.cardRect.w);
   const cardHeightPx = Math.max(1, centering.debug.cardRect.h);
   return {
-    left: (centering.debug.border.leftPx / cardWidthPx) * 64,
-    right: (centering.debug.border.rightPx / cardWidthPx) * 64,
-    top: (centering.debug.border.topPx / cardHeightPx) * 89,
-    bottom: (centering.debug.border.bottomPx / cardHeightPx) * 89
+    left: (centering.debug.border.leftPx / cardWidthPx) * STANDARD_CARD_DIMENSIONS_MM.width,
+    right: (centering.debug.border.rightPx / cardWidthPx) * STANDARD_CARD_DIMENSIONS_MM.width,
+    top: (centering.debug.border.topPx / cardHeightPx) * STANDARD_CARD_DIMENSIONS_MM.height,
+    bottom: (centering.debug.border.bottomPx / cardHeightPx) * STANDARD_CARD_DIMENSIONS_MM.height
   };
 }
